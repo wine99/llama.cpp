@@ -195,8 +195,7 @@ struct optimize_feature {
 
 struct sycl_device_info {
     int     cc;                 // compute capability
-    int nsm; // number of streaming multiprocessors (CUDA) maps to the maximum
-             // number of compute units on a SYCL device.
+    // int     nsm;                // number of streaming multiprocessors
     // size_t  smpb;               // max. shared memory per block
     size_t  smpbo;              // max. shared memory per block (with opt-in)
     bool    vmm;                // virtual memory support

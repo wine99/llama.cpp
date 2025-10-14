@@ -2,9 +2,8 @@
 	import { Check, X } from '@lucide/svelte';
 	import { Card } from '$lib/components/ui/card';
 	import { Button } from '$lib/components/ui/button';
-	import { ChatAttachmentsList, MarkdownContent } from '$lib/components/app';
+	import { ChatAttachmentsList } from '$lib/components/app';
 	import { INPUT_CLASSES } from '$lib/constants/input-classes';
-	import { config } from '$lib/stores/settings.svelte';
 	import ChatMessageActions from './ChatMessageActions.svelte';
 
 	interface Props {
@@ -56,7 +55,6 @@
 
 	let isMultiline = $state(false);
 	let messageElement: HTMLElement | undefined = $state();
-	const currentConfig = config();
 
 	$effect(() => {
 		if (!messageElement || !message.content.trim()) return;
@@ -125,18 +123,9 @@
 				class="max-w-[80%] rounded-[1.125rem] bg-primary px-3.75 py-1.5 text-primary-foreground data-[multiline]:py-2.5"
 				data-multiline={isMultiline ? '' : undefined}
 			>
-				{#if currentConfig.renderUserContentAsMarkdown}
-					<div bind:this={messageElement} class="text-md">
-						<MarkdownContent
-							class="markdown-user-content text-primary-foreground"
-							content={message.content}
-						/>
-					</div>
-				{:else}
-					<span bind:this={messageElement} class="text-md whitespace-pre-wrap">
-						{message.content}
-					</span>
-				{/if}
+				<span bind:this={messageElement} class="text-md whitespace-pre-wrap">
+					{message.content}
+				</span>
 			</Card>
 		{/if}
 

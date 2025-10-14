@@ -545,10 +545,6 @@ typedef struct{
 } ggml_metal_kargs_glu;
 
 typedef struct {
-    uint64_t np;
-} ggml_metal_kargs_sum;
-
-typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;
@@ -776,13 +772,5 @@ typedef struct {
      int64_t ne00;
     uint64_t nb01;
 } ggml_metal_kargs_argmax;
-
-typedef struct {
-    int64_t  np;
-} ggml_metal_kargs_opt_step_adamw;
-
-typedef struct {
-    int64_t  np;
-} ggml_metal_kargs_opt_step_sgd;
 
 #endif // GGML_METAL_IMPL

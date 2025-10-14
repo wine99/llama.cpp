@@ -197,7 +197,7 @@ class ServerStore {
 					errorMessage = 'Server not found - check server address';
 					isOfflineLikeError = true;
 				} else if (error.message.includes('ETIMEDOUT')) {
-					errorMessage = 'Request timed out - the server took too long to respond';
+					errorMessage = 'Connection timeout - server may be overloaded';
 					isOfflineLikeError = true;
 				} else if (error.message.includes('503')) {
 					errorMessage = 'Server temporarily unavailable - try again shortly';

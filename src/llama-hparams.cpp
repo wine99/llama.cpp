@@ -140,11 +140,7 @@ uint32_t llama_hparams::n_embd_s() const {
 }
 
 bool llama_hparams::is_recurrent(uint32_t il) const {
-    if (il < n_layer) {
-        return recurrent_layer_arr[il];
-    }
-
-    GGML_ABORT("%s: il (%u) out of bounds (n_layer: %u)\n", __func__, il, n_layer);
+    return recurrent_layer_arr[il];
 }
 
 uint32_t llama_hparams::n_pos_per_embd() const {

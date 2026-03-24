@@ -916,22 +916,15 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
         }
 
         case GGML_OP_ADD: {
-            // TODO correct but no perf gain
-            return false;
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
+
+            // Only accelerate bias-style adds
+            if (src0->op != GGML_OP_MUL_MAT) return false;
 
             // In-place ADD aliases src0/output memory. The current OV path binds
             // inputs and outputs separately, so reject these cases for now.
             if (ggml_impl_is_view(op)) return false;
-
-            // Repeated F32 accumulation chains drift beyond the very strict backend-op
-            // tolerance because the NPU executes the elementwise kernel in FP16.
-            // Keep leaf/bias-style adds enabled, but fall back for chained adds.
-            if (op->type == GGML_TYPE_F32) {
-                if (src0->op == GGML_OP_NONE && src1->op == GGML_OP_NONE) return false;
-                if ((src0->op == GGML_OP_ADD || src1->op == GGML_OP_ADD) && src0->op != GGML_OP_MUL_MAT) return false;
-            } 
 
             // OpenVINO NPU elementwise ADD supports NumPy-style broadcasting.
             // ggml also allows repeating non-unit dimensions (for example 10 -> 20),

@@ -329,6 +329,8 @@ static void ggml_backend_inpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 size_t offset,
                                                 size_t size) {
     auto * buf_ctx = static_cast<ggml_backend_inpu_buffer_context *>(buffer->context);
+    const bool    profile_enabled = inpu_debug_profile_enabled();
+    const int64_t t_start_us      = profile_enabled ? ggml_time_us() : 0;
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0: {
@@ -394,6 +396,10 @@ static void ggml_backend_inpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
             memcpy(static_cast<char *>(tensor->data) + offset, data, size);
             break;
     }
+
+    if (profile_enabled) {
+        inpu_profile_record_buffer_set(tensor->type, size, (uint64_t) (ggml_time_us() - t_start_us));
+    }
 }
 
 static void ggml_backend_inpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -402,6 +408,8 @@ static void ggml_backend_inpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                 size_t offset,
                                                 size_t size) {
     GGML_UNUSED(buffer);
+    const bool    profile_enabled = inpu_debug_profile_enabled();
+    const int64_t t_start_us      = profile_enabled ? ggml_time_us() : 0;
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
@@ -415,6 +423,10 @@ static void ggml_backend_inpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
         default:
             memcpy(data, static_cast<const char *>(tensor->data) + offset, size);
             break;
+    }
+
+    if (profile_enabled) {
+        inpu_profile_record_buffer_get(tensor->type, size, (uint64_t) (ggml_time_us() - t_start_us));
     }
 }
 
@@ -502,6 +514,23 @@ static void ggml_backend_inpu_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = static_cast<ggml_inpu_context *>(backend->context);
+    const bool              profile_enabled  = inpu_debug_profile_enabled();
+    const int64_t           t_total_start_us = profile_enabled ? ggml_time_us() : 0;
+    inpu_profile_graph_call profile_call;
+
+    if (profile_enabled) {
+        profile_call.graph_label = inpu_debug_graph_label(cgraph);
+        profile_call.n_nodes     = cgraph ? cgraph->n_nodes : 0;
+    }
+
+    auto finish = [&](enum ggml_status status) {
+        if (profile_enabled) {
+            profile_call.success  = status == GGML_STATUS_SUCCESS;
+            profile_call.total_us = (uint64_t) (ggml_time_us() - t_total_start_us);
+            inpu_profile_record_graph_call(profile_call);
+        }
+        return status;
+    };
 
     auto resolve_input_binding_tensor = [](const struct ggml_tensor * t) -> const struct ggml_tensor * {
         while (t && t->src[0]) {
@@ -521,7 +550,7 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
     };
 
     if (cgraph->n_nodes == 0) {
-        return GGML_STATUS_SUCCESS;
+        return finish(GGML_STATUS_SUCCESS);
     }
 
     // Check whether there is at least one real compute node (skip NONE)
@@ -534,14 +563,24 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
     }
 
     if (!has_compute) {
-        return GGML_STATUS_SUCCESS;
+        return finish(GGML_STATUS_SUCCESS);
     }
 
     // 1. Make cache key
+    const int64_t  t_key_start_us = profile_enabled ? ggml_time_us() : 0;
     inpu_graph_key key = inpu_make_graph_key(cgraph);
+    if (profile_enabled) {
+        profile_call.key_us     = (uint64_t) (ggml_time_us() - t_key_start_us);
+        profile_call.graph_hash = inpu_graph_key_hash{}(key);
+    }
 
     // 2. Look up cache
+    const int64_t t_cache_lookup_start_us = profile_enabled ? ggml_time_us() : 0;
     auto compiled = ctx->cache.find(key);
+    if (profile_enabled) {
+        profile_call.cache_lookup_us = (uint64_t) (ggml_time_us() - t_cache_lookup_start_us);
+        profile_call.cache_hit       = compiled != nullptr;
+    }
 
     if (!compiled) {
         // Debug: dump cgraph if requested via GGML_INPU_DUMP_CGRAPH=1
@@ -550,14 +589,22 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
         }
 
         // 3. Analyze I/O
+        const int64_t t_analyze_io_start_us = profile_enabled ? ggml_time_us() : 0;
         inpu_graph_io io = inpu_analyze_graph_io(cgraph);
+        if (profile_enabled) {
+            profile_call.analyze_io_us = (uint64_t) (ggml_time_us() - t_analyze_io_start_us);
+        }
 
         // 4. Translate to OV model
+        const int64_t         t_translate_start_us = profile_enabled ? ggml_time_us() : 0;
         inpu_translate_result result = inpu_translate_graph(cgraph, io);
+        if (profile_enabled) {
+            profile_call.translate_us = (uint64_t) (ggml_time_us() - t_translate_start_us);
+        }
 
         if (!result.model) {
             INPU_LOG_ERROR("failed to translate cgraph to OV model\n");
-            return GGML_STATUS_FAILED;
+            return finish(GGML_STATUS_FAILED);
         }
 
         // Debug: dump OV IR if requested via GGML_INPU_DUMP_IR=<dir>
@@ -565,6 +612,7 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
 
         // 5. Compile for NPU
         try {
+            const int64_t     t_compile_start_us = profile_enabled ? ggml_time_us() : 0;
             static ov::AnyMap config = {
                 {"NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES" },
                 {"NPU_USE_NPUW",                      "YES" },
@@ -579,15 +627,25 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
 
             ctx->cache.insert(key, compiled);
 
+            if (profile_enabled) {
+                profile_call.compile_us = (uint64_t) (ggml_time_us() - t_compile_start_us);
+            }
+
             INPU_LOG_DEBUG("compiled new OV model for NPU (%d nodes)\n", cgraph->n_nodes);
         } catch (const std::exception & e) {
             INPU_LOG_ERROR("OV compile failed: %s\n", e.what());
-            return GGML_STATUS_FAILED;
+            return finish(GGML_STATUS_FAILED);
         }
     }
 
     // 6. Acquire an InferRequest
-    ov::InferRequest infer_req = compiled->acquire_request();
+    bool             request_from_pool          = false;
+    const int64_t    t_acquire_request_start_us = profile_enabled ? ggml_time_us() : 0;
+    ov::InferRequest infer_req = compiled->acquire_request(profile_enabled ? &request_from_pool : nullptr);
+    if (profile_enabled) {
+        profile_call.request_from_pool  = request_from_pool;
+        profile_call.acquire_request_us = (uint64_t) (ggml_time_us() - t_acquire_request_start_us);
+    }
 
     auto ov_shape_nelements = [](const ov::Shape & shape) -> size_t {
         size_t n = 1;
@@ -599,6 +657,7 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
 
     try {
         // 7. Bind inputs
+        const int64_t t_bind_inputs_start_us = profile_enabled ? ggml_time_us() : 0;
         for (const auto & entry : compiled->input_map) {
             const struct ggml_tensor * node = cgraph->nodes[entry.node_idx >= 0 ? entry.node_idx : 0];
             const struct ggml_tensor * src_tensor = nullptr;
@@ -610,7 +669,7 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
             if (!src_tensor) {
                 INPU_LOG_ERROR("null src tensor for input '%s'\n", entry.ov_name.c_str());
                 compiled->release_request(std::move(infer_req));
-                return GGML_STATUS_FAILED;
+                return finish(GGML_STATUS_FAILED);
             }
 
             const struct ggml_tensor * bind_tensor = resolve_input_binding_tensor(src_tensor);
@@ -622,17 +681,27 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
                 if (!extra) {
                     INPU_LOG_ERROR("no tensor extra for quantized input '%s'\n", entry.ov_name.c_str());
                     compiled->release_request(std::move(infer_req));
-                    return GGML_STATUS_FAILED;
+                    return finish(GGML_STATUS_FAILED);
                 }
 
                 if (entry.is_quant) {
                     ov::Shape shape = infer_req.get_tensor(entry.ov_name).get_shape();
                     auto t = ov::Tensor(extra->quant_ov_type, shape, extra->quants);
                     infer_req.set_tensor(entry.ov_name, t);
+                    if (profile_enabled) {
+                        profile_call.input_tensors++;
+                        profile_call.quant_bytes += extra->quants_bytes;
+                        profile_call.input_bytes += extra->quants_bytes;
+                    }
                 } else {
                     ov::Shape shape = infer_req.get_tensor(entry.ov_name).get_shape();
                     auto t = ov::Tensor(extra->scale_ov_type, shape, extra->scales);
                     infer_req.set_tensor(entry.ov_name, t);
+                    if (profile_enabled) {
+                        profile_call.input_tensors++;
+                        profile_call.scale_bytes += extra->scales_bytes;
+                        profile_call.input_bytes += extra->scales_bytes;
+                    }
                 }
             } else {
                 // Non-quantized input: wrap the data pointer directly
@@ -645,14 +714,22 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
                     default:
                         INPU_LOG_ERROR("unsupported input type %d for '%s'\n", bind_tensor->type, entry.ov_name.c_str());
                         compiled->release_request(std::move(infer_req));
-                        return GGML_STATUS_FAILED;
+                        return finish(GGML_STATUS_FAILED);
                 }
                 auto t = ov::Tensor(ov_type, shape, const_cast<void *>(data_ptr));
                 infer_req.set_tensor(entry.ov_name, t);
+                if (profile_enabled) {
+                    profile_call.input_tensors++;
+                    profile_call.input_bytes += ggml_nbytes(bind_tensor);
+                }
             }
+        }
+        if (profile_enabled) {
+            profile_call.bind_inputs_us = (uint64_t) (ggml_time_us() - t_bind_inputs_start_us);
         }
 
         // 8. Bind outputs
+        const int64_t t_bind_outputs_start_us = profile_enabled ? ggml_time_us() : 0;
         for (const auto & entry : compiled->output_map) {
             struct ggml_tensor * node = cgraph->nodes[entry.bind_node_idx];
 
@@ -663,7 +740,7 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
                 INPU_LOG_ERROR("output shape mismatch for '%s': OV has %zu elements, ggml tensor has %zu\n",
                                entry.ov_name.c_str(), ov_nelements, ggml_nelems);
                 compiled->release_request(std::move(infer_req));
-                return GGML_STATUS_FAILED;
+                return finish(GGML_STATUS_FAILED);
             }
 
             ov::element::Type ov_type;
@@ -673,25 +750,40 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
                 default:
                     INPU_LOG_ERROR("unsupported output type %d for '%s'\n", node->type, entry.ov_name.c_str());
                     compiled->release_request(std::move(infer_req));
-                    return GGML_STATUS_FAILED;
+                    return finish(GGML_STATUS_FAILED);
             }
             auto t = ov::Tensor(ov_type, shape, node->data);
             infer_req.set_tensor(entry.ov_name, t);
+            if (profile_enabled) {
+                profile_call.output_tensors++;
+                profile_call.output_bytes += ggml_nbytes(node);
+            }
+        }
+        if (profile_enabled) {
+            profile_call.bind_outputs_us = (uint64_t) (ggml_time_us() - t_bind_outputs_start_us);
         }
 
         // 9. Run inference
+        const int64_t t_infer_start_us = profile_enabled ? ggml_time_us() : 0;
         infer_req.infer();
+        if (profile_enabled) {
+            profile_call.infer_us = (uint64_t) (ggml_time_us() - t_infer_start_us);
+        }
 
     } catch (const std::exception & e) {
         INPU_LOG_ERROR("OV inference failed: %s\n", e.what());
         compiled->release_request(std::move(infer_req));
-        return GGML_STATUS_FAILED;
+        return finish(GGML_STATUS_FAILED);
     }
 
     // 10. Return the InferRequest to the pool
+    const int64_t t_release_request_start_us = profile_enabled ? ggml_time_us() : 0;
     compiled->release_request(std::move(infer_req));
+    if (profile_enabled) {
+        profile_call.release_request_us = (uint64_t) (ggml_time_us() - t_release_request_start_us);
+    }
 
-    return GGML_STATUS_SUCCESS;
+    return finish(GGML_STATUS_SUCCESS);
 }
 
 // Backend interface

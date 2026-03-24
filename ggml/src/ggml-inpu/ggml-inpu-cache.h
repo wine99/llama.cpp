@@ -2,15 +2,13 @@
 
 // ggml-inpu cache: compiled OV model caching
 
-#include "ggml-inpu-impl.h"
-
-#include <openvino/openvino.hpp>
+#include "ggml.h"
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
+#include <openvino/openvino.hpp>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -70,7 +68,7 @@ struct inpu_compiled_graph {
     std::vector<io_entry> output_map;
 
     // Acquire an InferRequest (creates one if pool is empty)
-    ov::InferRequest acquire_request();
+    ov::InferRequest acquire_request(bool * from_pool = nullptr);
     // Return an InferRequest to the pool
     void release_request(ov::InferRequest && req);
 };

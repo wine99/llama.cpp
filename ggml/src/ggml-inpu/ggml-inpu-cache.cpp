@@ -122,12 +122,18 @@ inpu_graph_key inpu_make_graph_key(const struct ggml_cgraph * cgraph) {
 // Compiled graph — InferRequest pool
 // ============================================================================
 
-ov::InferRequest inpu_compiled_graph::acquire_request() {
+ov::InferRequest inpu_compiled_graph::acquire_request(bool * from_pool) {
     std::lock_guard<std::mutex> lock(pool_mutex);
     if (!request_pool.empty()) {
+        if (from_pool) {
+            *from_pool = true;
+        }
         auto req = std::move(request_pool.back());
         request_pool.pop_back();
         return req;
+    }
+    if (from_pool) {
+        *from_pool = false;
     }
     // Create new
     return compiled_model->create_infer_request();

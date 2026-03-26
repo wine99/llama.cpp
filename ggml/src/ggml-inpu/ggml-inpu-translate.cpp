@@ -4,9 +4,16 @@
 // plus optional fused ADD, GLU, RMS_NORM, ROPE, and RESHAPE ops.
 
 #include "ggml-inpu-translate.h"
-#include "ggml-inpu-impl.h"
-#include "ggml-impl.h"
 
+#include "ggml-impl.h"
+#include "ggml-inpu-impl.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <numeric>
 #include <openvino/op/add.hpp>
 #include <openvino/op/broadcast.hpp>
 #include <openvino/op/clamp.hpp>
@@ -15,32 +22,28 @@
 #include <openvino/op/convert.hpp>
 #include <openvino/op/cos.hpp>
 #include <openvino/op/divide.hpp>
+#include <openvino/op/gather.hpp>
+#include <openvino/op/gelu.hpp>
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/maximum.hpp>
 #include <openvino/op/multiply.hpp>
 #include <openvino/op/parameter.hpp>
 #include <openvino/op/power.hpp>
 #include <openvino/op/reduce_mean.hpp>
+#include <openvino/op/relu.hpp>
 #include <openvino/op/reshape.hpp>
 #include <openvino/op/result.hpp>
+#include <openvino/op/scaled_dot_product_attention.hpp>
+#include <openvino/op/scatter_update.hpp>
 #include <openvino/op/sin.hpp>
 #include <openvino/op/slice.hpp>
 #include <openvino/op/split.hpp>
-#include <openvino/op/squeeze.hpp>
 #include <openvino/op/sqrt.hpp>
+#include <openvino/op/squeeze.hpp>
 #include <openvino/op/subtract.hpp>
+#include <openvino/op/swish.hpp>
 #include <openvino/op/transpose.hpp>
 #include <openvino/op/unsqueeze.hpp>
-#include <openvino/op/gelu.hpp>
-#include <openvino/op/swish.hpp>
-#include <openvino/op/relu.hpp>
-
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <memory>
-#include <numeric>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -171,6 +174,12 @@ inpu_graph_io inpu_analyze_graph_io(const struct ggml_cgraph * cgraph) {
                 continue;
             }
 
+            // CPY: src[1] is the destination template, not a data dependency.
+            // Skip it to avoid creating an unused OV Parameter.
+            if (node->op == GGML_OP_CPY && s == 1) {
+                continue;
+            }
+
             if (node_outputs.count(src)) {
                 continue;
             }
@@ -212,6 +221,8 @@ static ov::element::Type ggml_type_to_ov(enum ggml_type type) {
         case GGML_TYPE_F32: return ov::element::f32;
         case GGML_TYPE_F16: return ov::element::f16;
         case GGML_TYPE_I32: return ov::element::i32;
+        case GGML_TYPE_I64:
+            return ov::element::i64;
         default:
             GGML_ABORT("unsupported ggml type for OV conversion: %d", type);
     }
@@ -929,27 +940,53 @@ static ov::Output<ov::Node> translate_permute(
     GGML_ASSERT(it0 != tensor_map.end());
 
     ov::Output<ov::Node> input = it0->second;
-    const auto & ov_shape = input.get_shape();
-    const int ndims = (int) ov_shape.size();
 
     // Read ggml permute axes from op_params
     int32_t ggml_axes[4];
     memcpy(ggml_axes, node->op_params, sizeof(ggml_axes));
 
+    bool seen_axis[4] = { false, false, false, false };
+    for (int i = 0; i < 4; i++) {
+        if (ggml_axes[i] < 0 || ggml_axes[i] >= GGML_MAX_DIMS) {
+            GGML_ABORT("invalid PERMUTE axis %d at index %d", ggml_axes[i], i);
+        }
+        if (seen_axis[ggml_axes[i]]) {
+            GGML_ABORT("duplicate PERMUTE axis %d", ggml_axes[i]);
+        }
+        seen_axis[ggml_axes[i]] = true;
+    }
+
+    std::vector<int64_t> src_shape_4d(GGML_MAX_DIMS);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        src_shape_4d[i] = node->src[0]->ne[GGML_MAX_DIMS - 1 - i];
+    }
+
+    auto src_shape_const = ov::op::v0::Constant::create(ov::element::i64, { (size_t) GGML_MAX_DIMS }, src_shape_4d);
+    auto input_4d        = std::make_shared<ov::op::v1::Reshape>(input, src_shape_const, false);
+
     // Convert ggml axes → OV transpose order
-    // ggml dim i maps to OV dim (ndims-1-i) (assuming only ndims active dims)
-    std::vector<int64_t> ov_order(ndims);
-    for (int i = 0; i < ndims; i++) {
+    std::vector<int64_t> ov_order(GGML_MAX_DIMS);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
         int ggml_src_dim = ggml_axes[i]; // ggml source dim that goes to position i
-        int ov_dst = ndims - 1 - i;
-        int ov_src = ndims - 1 - ggml_src_dim;
+        int ov_dst       = GGML_MAX_DIMS - 1 - i;
+        int ov_src       = GGML_MAX_DIMS - 1 - ggml_src_dim;
         ov_order[ov_dst] = ov_src;
     }
 
-    auto order_const = ov::op::v0::Constant::create(
-        ov::element::i64, {(size_t) ndims}, ov_order);
+    auto order_const = ov::op::v0::Constant::create(ov::element::i64, { (size_t) GGML_MAX_DIMS }, ov_order);
 
-    return std::make_shared<ov::op::v1::Transpose>(input, order_const);
+    auto transposed_4d = std::make_shared<ov::op::v1::Transpose>(input_4d, order_const);
+
+    ov::Shape            target_ov_shape = ggml_tensor_to_ov_shape(node);
+    std::vector<int64_t> target_shape_vec(target_ov_shape.size());
+    for (size_t i = 0; i < target_ov_shape.size(); i++) {
+        target_shape_vec[i] = (int64_t) target_ov_shape[i];
+    }
+
+    auto target_shape_const =
+        ov::op::v0::Constant::create(ov::element::i64, { target_shape_vec.size() }, target_shape_vec);
+
+    return std::make_shared<ov::op::v1::Reshape>(transposed_4d, target_shape_const, false);
 }
 
 // ============================================================================
@@ -1013,6 +1050,33 @@ static ov::Output<ov::Node> translate_view(
     const size_t src_view_offs = src->view_src ? src->view_offs : 0;
     const size_t byte_offset   = node->view_offs - src_view_offs;
     const size_t elem_size     = ggml_type_size(node->type);
+
+    // For contiguous views, treat VIEW as a flat sub-range followed by reshape.
+    // This correctly handles patterns that both slice and reshape (e.g. KV-cache
+    // views), which are not representable as pure per-dimension slices in the
+    // source's effective rank.
+    if (ggml_is_contiguous(node)) {
+        GGML_ASSERT(byte_offset % elem_size == 0);
+
+        const int64_t start = (int64_t) (byte_offset / elem_size);
+        const int64_t len   = (int64_t) ggml_nelements(node);
+
+        auto flat_shape = ov::op::v0::Constant::create(ov::element::i64, { 1 }, { -1 });
+        auto flat       = std::make_shared<ov::op::v1::Reshape>(input, flat_shape, false);
+
+        auto start_c = ov::op::v0::Constant::create(ov::element::i64, { 1 }, { start });
+        auto stop_c  = ov::op::v0::Constant::create(ov::element::i64, { 1 }, { start + len });
+        auto step_c  = ov::op::v0::Constant::create(ov::element::i64, { 1 }, { 1 });
+        auto axis_c  = ov::op::v0::Constant::create(ov::element::i64, { 1 }, { 0 });
+        auto sliced  = std::make_shared<ov::op::v8::Slice>(flat, start_c, stop_c, step_c, axis_c);
+
+        ov::Shape            target = ggml_tensor_to_ov_shape(node);
+        std::vector<int64_t> target_shape_vec(target.begin(), target.end());
+        auto                 target_shape_const =
+            ov::op::v0::Constant::create(ov::element::i64, { target_shape_vec.size() }, target_shape_vec);
+
+        return std::make_shared<ov::op::v1::Reshape>(sliced, target_shape_const, false);
+    }
 
     // Effective dimensionality (same logic as ggml_tensor_to_ov_shape)
     int ndims = GGML_MAX_DIMS;
@@ -1128,6 +1192,263 @@ static const struct ggml_tensor * inpu_get_output_materialization_tensor(const s
     }
 
     return t;
+}
+
+// ============================================================================
+// Translate GET_ROWS (non-quantized)
+//
+// Gathers rows from a data table using integer indices.
+// src[0] = data [n_embd, n_vocab, ...] (F16/F32)
+// src[1] = indices [n_rows, ...] (I32)
+// dst = [n_embd, n_rows, ...]
+//
+// OV shapes (reversed): data [n_vocab, n_embd], indices [n_rows], dst [n_rows, n_embd]
+// ============================================================================
+
+static ov::Output<ov::Node> translate_get_rows(
+    const struct ggml_tensor *                                                   node,
+    const std::unordered_map<const struct ggml_tensor *, ov::Output<ov::Node>> & tensor_map) {
+    auto it_data = tensor_map.find(node->src[0]);
+    auto it_idx  = tensor_map.find(node->src[1]);
+    GGML_ASSERT(it_data != tensor_map.end() && it_idx != tensor_map.end());
+
+    ov::Output<ov::Node> data    = it_data->second;
+    ov::Output<ov::Node> indices = it_idx->second;
+
+    // Squeeze indices to 1D if needed (ggml indices may have trailing dims)
+    auto idx_shape = indices.get_shape();
+    if (idx_shape.size() > 1) {
+        std::vector<int64_t> squeeze_axes;
+        for (size_t i = 0; i < idx_shape.size() - 1; i++) {
+            squeeze_axes.push_back((int64_t) i);
+        }
+        auto axes_const = ov::op::v0::Constant::create(ov::element::i64, { squeeze_axes.size() }, squeeze_axes);
+        indices         = std::make_shared<ov::op::v0::Squeeze>(indices, axes_const);
+    }
+
+    // Gather along axis 0 (first OV dim = ggml's last active dim = the "row" dim)
+    auto axis     = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{}, { 0 });
+    auto gathered = std::make_shared<ov::op::v8::Gather>(data, indices, axis);
+
+    // Convert output type if needed
+    ov::element::Type    dst_type = ggml_type_to_ov(node->type);
+    ov::Output<ov::Node> output   = gathered;
+    if (gathered->get_output_element_type(0) != dst_type) {
+        output = std::make_shared<ov::op::v0::Convert>(gathered, dst_type);
+    }
+
+    return output;
+}
+
+// ============================================================================
+// Translate SET_ROWS
+//
+// Scatters rows from source data into a destination tensor at given indices.
+// src[0] = source data [n_embd, n_rows, ...] (F32)
+// src[1] = indices [n_rows, ...] (I64/I32)
+// src[2] = destination [n_embd, n_total, ...] (the KV cache)
+// dst = view(destination) with same shape
+//
+// OV shapes (reversed): src [n_rows, n_embd], indices [n_rows], dest [n_total, n_embd]
+// ============================================================================
+
+static ov::Output<ov::Node> translate_set_rows(
+    const struct ggml_tensor *                                                   node,
+    const std::unordered_map<const struct ggml_tensor *, ov::Output<ov::Node>> & tensor_map) {
+    auto it_src = tensor_map.find(node->src[0]);
+    auto it_idx = tensor_map.find(node->src[1]);
+    auto it_dst = tensor_map.find(node->src[2]);
+    GGML_ASSERT(it_src != tensor_map.end() && it_idx != tensor_map.end() && it_dst != tensor_map.end());
+
+    ov::Output<ov::Node> src_data = it_src->second;
+    ov::Output<ov::Node> indices  = it_idx->second;
+    ov::Output<ov::Node> dest     = it_dst->second;
+
+    // Convert source data to destination type if needed
+    ov::element::Type dst_type = ggml_type_to_ov(node->type);
+    if (src_data.get_element_type() != dst_type) {
+        src_data = std::make_shared<ov::op::v0::Convert>(src_data, dst_type);
+    }
+
+    // SET_ROWS with ScatterUpdate supports a shared row index vector only.
+    // Per-batch index tensors (rank > 1 with non-trivial leading dims) are not
+    // representable with ScatterUpdate and should be filtered by can_support_op.
+    auto idx_shape = indices.get_shape();
+    if (idx_shape.size() > 1) {
+        for (size_t i = 0; i + 1 < idx_shape.size(); ++i) {
+            GGML_ASSERT(idx_shape[i] == 1);
+        }
+
+        std::vector<int64_t> squeeze_axes;
+        for (size_t i = 0; i + 1 < idx_shape.size(); ++i) {
+            squeeze_axes.push_back((int64_t) i);
+        }
+        auto axes_const = ov::op::v0::Constant::create(ov::element::i64, { squeeze_axes.size() }, squeeze_axes);
+        indices         = std::make_shared<ov::op::v0::Squeeze>(indices, axes_const);
+    }
+
+    // Convert indices to i32 if they are i64 (ScatterUpdate prefers i32 indices)
+    if (indices.get_element_type() == ov::element::i64) {
+        indices = std::make_shared<ov::op::v0::Convert>(indices, ov::element::i32);
+    }
+
+    const ov::Shape data_shape = dest.get_shape();
+    GGML_ASSERT(data_shape.size() >= 2);
+
+    // OV shape order is reversed from ggml. For SET_ROWS, row dim is ggml ne[1],
+    // which maps to axis (rank - 2) in OV.
+    const int32_t row_axis = (int32_t) (data_shape.size() - 2);
+
+    auto axis   = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{}, { row_axis });
+    auto result = std::make_shared<ov::op::v3::ScatterUpdate>(dest, indices, src_data, axis);
+
+    return result;
+}
+
+// ============================================================================
+// Translate CPY (copy / type conversion)
+//
+// CPY(a, b) copies data from a into b's type. b is only used for its type/shape.
+// src[0] = source data, src[1] = destination template (ignored)
+// dst has the type of b.
+// ============================================================================
+
+static ov::Output<ov::Node> translate_cpy(
+    const struct ggml_tensor *                                                   node,
+    const std::unordered_map<const struct ggml_tensor *, ov::Output<ov::Node>> & tensor_map) {
+    auto it0 = tensor_map.find(node->src[0]);
+    GGML_ASSERT(it0 != tensor_map.end());
+
+    ov::Output<ov::Node> input = it0->second;
+
+    // Convert to the output type
+    ov::element::Type dst_type = ggml_type_to_ov(node->type);
+    if (input.get_element_type() != dst_type) {
+        input = std::make_shared<ov::op::v0::Convert>(input, dst_type);
+    }
+
+    return input;
+}
+
+// ============================================================================
+// Translate FLASH_ATTN_EXT
+//
+// Implements scaled dot-product attention using OV's SDPA op.
+//
+// ggml layout:
+//   Q (src[0]): [head_dim, seq,  n_head,    1]  — already permuted
+//   K (src[1]): [head_dim, n_kv, n_head_kv, 1]  — permuted cache view
+//   V (src[2]): [head_dim, n_kv, n_head_kv, 1]  — permuted cache view
+//   mask (src[3]): [n_kv, seq, 1, 1]
+//   dst:        [head_dim, n_head, seq, 1]       — permuted output
+//
+// OV shapes (after ggml→OV reversal, trimming trailing 1s):
+//   Q:    [n_head, seq, head_dim]       (3D)
+//   K:    [n_head_kv, n_kv, head_dim]   (3D)
+//   V:    [n_head_kv, n_kv, head_dim]   (3D)
+//   mask: [seq, n_kv]                   (2D)
+//   dst:  [seq, n_head, head_dim]       (3D)
+//
+// SDPA expects 4D: [batch, heads, seq_len, head_dim]
+// ============================================================================
+
+static ov::Output<ov::Node> translate_flash_attn_ext(
+    const struct ggml_tensor *                                                   node,
+    const std::unordered_map<const struct ggml_tensor *, ov::Output<ov::Node>> & tensor_map) {
+    auto it_q    = tensor_map.find(node->src[0]);
+    auto it_k    = tensor_map.find(node->src[1]);
+    auto it_v    = tensor_map.find(node->src[2]);
+    auto it_mask = tensor_map.find(node->src[3]);
+    GGML_ASSERT(it_q != tensor_map.end() && it_k != tensor_map.end() && it_v != tensor_map.end() &&
+                it_mask != tensor_map.end());
+
+    ov::Output<ov::Node> q    = it_q->second;
+    ov::Output<ov::Node> k    = it_k->second;
+    ov::Output<ov::Node> v    = it_v->second;
+    ov::Output<ov::Node> mask = it_mask->second;
+
+    // Extract scale from op_params
+    float scale;
+    memcpy(&scale, node->op_params, sizeof(float));
+
+    // Get dimension info from ggml tensor shapes
+    const int64_t head_dim  = node->src[0]->ne[0];
+    const int64_t seq_len   = node->src[0]->ne[1];
+    const int64_t n_head    = node->src[0]->ne[2];
+    const int64_t n_kv      = node->src[1]->ne[1];
+    const int64_t n_head_kv = node->src[1]->ne[2];
+
+    // Reshape Q, K, V to 4D: [1, heads, seq/kv, head_dim]
+    auto reshape_to_4d = [](ov::Output<ov::Node> & t, int64_t batch, int64_t heads, int64_t seq, int64_t hd) {
+        auto shape =
+            ov::op::v0::Constant::create(ov::element::i64, { 4 }, std::vector<int64_t>{ batch, heads, seq, hd });
+        t = std::make_shared<ov::op::v1::Reshape>(t, shape, false);
+    };
+
+    reshape_to_4d(q, 1, n_head, seq_len, head_dim);
+    reshape_to_4d(k, 1, n_head_kv, n_kv, head_dim);
+    reshape_to_4d(v, 1, n_head_kv, n_kv, head_dim);
+
+    // GQA tiling: broadcast K and V from n_head_kv to n_head
+    auto tile_kv = [&](ov::Output<ov::Node> & kv) {
+        int64_t factor = n_head / n_head_kv;
+        if (factor > 1 && n_head_kv > 1) {
+            auto unsqueeze_axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, { 2 });
+            auto kv_unsqueezed  = std::make_shared<ov::op::v0::Unsqueeze>(kv, unsqueeze_axes);
+
+            auto bcast_shape =
+                ov::op::v0::Constant::create(ov::element::i64, { 5 }, std::vector<int64_t>{ 1, 1, factor, 1, 1 });
+            auto kv_broadcasted = std::make_shared<ov::op::v3::Broadcast>(kv_unsqueezed, bcast_shape,
+                                                                          ov::op::BroadcastType::BIDIRECTIONAL);
+
+            auto new_shape =
+                ov::op::v0::Constant::create(ov::element::i64, { 4 }, std::vector<int64_t>{ 1, n_head, -1, head_dim });
+            kv = std::make_shared<ov::op::v1::Reshape>(kv_broadcasted, new_shape, true);
+        }
+    };
+
+    tile_kv(k);
+    tile_kv(v);
+
+    // Reshape mask to 4D: [1, 1, seq, n_kv] for broadcasting over batch+heads
+    auto mask_4d_shape =
+        ov::op::v0::Constant::create(ov::element::i64, { 4 }, std::vector<int64_t>{ 1, 1, seq_len, n_kv });
+    mask = std::make_shared<ov::op::v1::Reshape>(mask, mask_4d_shape, false);
+
+    // Convert Q, K, V, mask to f16 for NPU efficiency
+    if (q.get_element_type() != ov::element::f16) {
+        q = std::make_shared<ov::op::v0::Convert>(q, ov::element::f16);
+    }
+    if (k.get_element_type() != ov::element::f16) {
+        k = std::make_shared<ov::op::v0::Convert>(k, ov::element::f16);
+    }
+    if (v.get_element_type() != ov::element::f16) {
+        v = std::make_shared<ov::op::v0::Convert>(v, ov::element::f16);
+    }
+    if (mask.get_element_type() != ov::element::f16) {
+        mask = std::make_shared<ov::op::v0::Convert>(mask, ov::element::f16);
+    }
+
+    auto scale_const =
+        std::make_shared<ov::op::v0::Constant>(ov::element::f16, ov::Shape{}, std::vector<float>{ scale });
+
+    // ScaledDotProductAttention(Q, K, V, mask, scale, is_causal=false)
+    auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(q, k, v, mask, scale_const, false);
+
+    // SDPA output: [1, n_head, seq, head_dim]
+    // ggml expects dst: [head_dim, n_head, seq, 1] → OV [seq, n_head, head_dim] (3D)
+    // Transpose: [1, n_head, seq, head_dim] → [1, seq, n_head, head_dim]
+    auto transpose_order = ov::op::v0::Constant::create(ov::element::i64, { 4 }, std::vector<int64_t>{ 0, 2, 1, 3 });
+    auto transposed      = std::make_shared<ov::op::v1::Transpose>(sdpa, transpose_order);
+
+    // Convert back to f32
+    ov::Output<ov::Node> output = std::make_shared<ov::op::v0::Convert>(transposed, ov::element::f32);
+
+    // Squeeze batch dim back to 3D: [seq, n_head, head_dim]
+    auto squeeze_axes = ov::op::v0::Constant::create(ov::element::i64, { 1 }, { (int64_t) 0 });
+    output            = std::make_shared<ov::op::v0::Squeeze>(output, squeeze_axes);
+
+    return output;
 }
 
 static int inpu_find_node_index(const struct ggml_cgraph * cgraph, const struct ggml_tensor * tensor) {
@@ -1320,6 +1641,27 @@ inpu_translate_result inpu_translate_graph(const struct ggml_cgraph * cgraph, co
 
                 case GGML_OP_VIEW:
                     output = translate_view(node, tensor_map);
+                    break;
+
+                case GGML_OP_GET_ROWS:
+                    output = translate_get_rows(node, tensor_map);
+                    break;
+
+                case GGML_OP_SET_ROWS:
+                    output                   = translate_set_rows(node, tensor_map);
+                    // SET_ROWS writes into src[2] (the cache) in-place in ggml.
+                    // In OV, ScatterUpdate produces a *new* tensor. Redirect
+                    // downstream reads of the cache leaf to the updated value
+                    // so that VIEWs feeding SDPA see post-scatter data.
+                    tensor_map[node->src[2]] = output;
+                    break;
+
+                case GGML_OP_CPY:
+                    output = translate_cpy(node, tensor_map);
+                    break;
+
+                case GGML_OP_FLASH_ATTN_EXT:
+                    output = translate_flash_attn_ext(node, tensor_map);
                     break;
 
                 default:

@@ -800,6 +800,9 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
                     case GGML_TYPE_F32: ov_type = ov::element::f32; break;
                     case GGML_TYPE_F16: ov_type = ov::element::f16; break;
                     case GGML_TYPE_I32: ov_type = ov::element::i32; break;
+                    case GGML_TYPE_I64:
+                        ov_type = ov::element::i64;
+                        break;
                     default:
                         INPU_LOG_ERROR("unsupported input type %d for '%s'\n", bind_tensor->type, entry.ov_name.c_str());
                         compiled->release_request(std::move(infer_req));
@@ -939,7 +942,7 @@ static void ggml_backend_inpu_device_get_memory(ggml_backend_dev_t dev, size_t *
 }
 
 static enum ggml_backend_dev_type ggml_backend_inpu_device_get_type(ggml_backend_dev_t dev) {
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
     GGML_UNUSED(dev);
 }
 
@@ -998,13 +1001,11 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
 
     switch (op->op) {
         case GGML_OP_NONE:
-            return true;
-
         case GGML_OP_RESHAPE:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_VIEW:
-            return op->src[0] && ggml_inpu_tensor_in_inpu_buffer(op->src[0]);
+            return true;
 
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0]; // weights
@@ -1039,9 +1040,6 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_ADD: {
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
-
-            // Only accelerate bias-style adds
-            if (src0->op != GGML_OP_MUL_MAT) return false;
 
             // In-place ADD aliases src0/output memory. The current OV path binds
             // inputs and outputs separately, so reject these cases for now.
@@ -1080,8 +1078,6 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
         }
 
         case GGML_OP_MUL: {
-            // TODO correct but no perf gain
-            return false;
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
             if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
@@ -1092,8 +1088,6 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
         }
 
         case GGML_OP_ROPE: {
-            // TODO correct but no perf gain
-            return false;
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
             // Only F32/F16 data, I32 positions
@@ -1106,6 +1100,80 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
             if (ggml_impl_is_view(op)) return false;
             return true;
         }
+
+        case GGML_OP_GET_ROWS:
+            {
+                const struct ggml_tensor * src0 = op->src[0];  // data table
+                // Only support non-quantized data (F16/F32). Quantized embedding
+                // lookups stay on CPU — llama.cpp does not offload them to backends.
+                if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                return true;
+            }
+
+        case GGML_OP_SET_ROWS:
+            {
+                const struct ggml_tensor * src0 = op->src[0];  // source data
+                const struct ggml_tensor * src1 = op->src[1];  // indices
+                const struct ggml_tensor * src2 = op->src[2];  // destination
+                if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (src2->type != GGML_TYPE_F32 && src2->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (src1->type != GGML_TYPE_I64 && src1->type != GGML_TYPE_I32) {
+                    return false;
+                }
+
+                // Match ggml_set_rows() constraints, including batched index
+                // broadcast over dims 2/3.
+                if (src0->ne[0] != src2->ne[0]) {
+                    return false;
+                }
+                if (src0->ne[2] != src2->ne[2] || src0->ne[3] != src2->ne[3]) {
+                    return false;
+                }
+                if (src0->ne[1] != src1->ne[0]) {
+                    return false;
+                }
+                // ScatterUpdate path supports only a shared row index vector.
+                // Per-batch index tensors are currently unsupported.
+                // Zero-sized SET_ROWS also fail during NPU compile.
+                if (src1->ne[0] == 0 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+                    return false;
+                }
+                return true;
+            }
+
+        case GGML_OP_CPY:
+            {
+                const struct ggml_tensor * src0 = op->src[0];
+                // Only support float-to-float copies
+                if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                return true;
+            }
+
+        case GGML_OP_FLASH_ATTN_EXT:
+            {
+                // Only support standard attention (no ALiBi, no logit softcap)
+                float max_bias, logit_softcap;
+                memcpy(&max_bias, (const char *) op->op_params + sizeof(float), sizeof(float));
+                memcpy(&logit_softcap, (const char *) op->op_params + 2 * sizeof(float), sizeof(float));
+                if (max_bias != 0.0f) {
+                    return false;
+                }
+                if (logit_softcap != 0.0f) {
+                    return false;
+                }
+                return true;
+            }
 
         default:
             return false;

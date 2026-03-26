@@ -45,6 +45,33 @@ struct ggml_inpu_shared_runtime {
     std::shared_ptr<ov::intel_npu::level_zero::ZeroContext> l0_context;
 };
 
+static const char * inpu_get_target_device_kind(void) {
+    static const char * cached = []() -> const char * {
+        const char * val = std::getenv("GGML_INPU_DEVICE");
+        if (!val || *val == '\0') {
+            return "NPU";
+        }
+
+        if (std::strcmp(val, "CPU") == 0) {
+            return "CPU";
+        }
+        if (std::strcmp(val, "NPU") == 0) {
+            return "NPU";
+        }
+
+        INPU_LOG_WARN("unknown GGML_INPU_DEVICE=%s, expected NPU or CPU; defaulting to NPU\n", val);
+        return "NPU";
+    }();
+
+    return cached;
+}
+
+static bool inpu_use_groups_first_quant_layout(void) {
+    // NPU path uses groups-first [n_groups, N, gs] for best performance.
+    // CPU path keeps row-first [N, n_groups, gs] to avoid extra permutation.
+    return std::strcmp(inpu_get_target_device_kind(), "NPU") == 0;
+}
+
 struct ggml_inpu_context {
     ggml_inpu_shared_runtime * runtime;  // shared singleton, not owned
     inpu_cache                 cache;
@@ -63,21 +90,22 @@ static void ggml_inpu_init_shared_runtime() {
         return;
     }
 
+    const char * target_kind = inpu_get_target_device_kind();
     runtime.core        = std::make_shared<ov::Core>();
-    runtime.device_name = "NPU";
+    runtime.device_name = target_kind;
 
     try {
-        auto devices   = runtime.core->get_available_devices();
-        bool found_npu = false;
+        auto devices       = runtime.core->get_available_devices();
+        bool found_target  = false;
         for (const auto & dev : devices) {
-            if (dev.find("NPU") != std::string::npos) {
-                found_npu           = true;
+            if (dev.find(target_kind) != std::string::npos) {
+                found_target        = true;
                 runtime.device_name = dev;
                 break;
             }
         }
-        if (!found_npu) {
-            INPU_LOG_WARN("no NPU device found in OpenVINO, available devices:");
+        if (!found_target) {
+            INPU_LOG_WARN("no %s device found in OpenVINO, available devices:", target_kind);
             for (const auto & dev : devices) {
                 INPU_LOG_WARN("  %s", dev.c_str());
             }
@@ -86,11 +114,14 @@ static void ggml_inpu_init_shared_runtime() {
         INPU_LOG_ERROR("failed to enumerate OV devices: %s\n", e.what());
     }
 
-    try {
-        auto l0 = runtime.core->get_default_context(runtime.device_name).as<ov::intel_npu::level_zero::ZeroContext>();
-        runtime.l0_context = std::make_shared<ov::intel_npu::level_zero::ZeroContext>(std::move(l0));
-    } catch (const std::exception & e) {
-        INPU_LOG_WARN("failed to create shared NPU Level Zero context: %s\n", e.what());
+    // Only create L0 context for NPU device
+    if (std::strcmp(target_kind, "NPU") == 0) {
+        try {
+            auto l0 = runtime.core->get_default_context(runtime.device_name).as<ov::intel_npu::level_zero::ZeroContext>();
+            runtime.l0_context = std::make_shared<ov::intel_npu::level_zero::ZeroContext>(std::move(l0));
+        } catch (const std::exception & e) {
+            INPU_LOG_WARN("failed to create shared NPU Level Zero context: %s\n", e.what());
+        }
     }
 }
 
@@ -216,7 +247,11 @@ static void pack_32_4(const uint8_t * src, uint8_t * dst) {
     }
 }
 
-static void inpu_reformat_q4_0_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static void inpu_reformat_q4_0_set(struct ggml_tensor * tensor,
+                                   const void *         data,
+                                   size_t               offset,
+                                   size_t               size,
+                                   bool                 groups_first_layout) {
     GGML_ASSERT(offset == 0);
 
     const int64_t n_rows = ggml_nrows(tensor);
@@ -245,12 +280,14 @@ static void inpu_reformat_q4_0_set(struct ggml_tensor * tensor, const void * dat
 
         for (int64_t b = 0; b < n_blocks_per_row; b++) {
             const uint8_t * block = src_row + b * block_size;
-            // Extract fp16 scale → dst[b * n_rows + row] (groups-first)
-            memcpy(dst_scales + (b * n_rows + row) * sizeof(uint16_t), block, sizeof(uint16_t));
+            const size_t    idx =
+                groups_first_layout ? (size_t) (b * n_rows + row) : (size_t) (row * n_blocks_per_row + b);
+
+            memcpy(dst_scales + idx * sizeof(uint16_t), block, sizeof(uint16_t));
             // Repack u4 nibbles from ggml → OV layout, then XOR 0x88 to convert u4→i4
             uint8_t tmp[16];
             unpack_32_4(block + sizeof(uint16_t), tmp);
-            uint8_t * dst_q = dst_quants + (b * n_rows + row) * quant_group_bytes;
+            uint8_t * dst_q = dst_quants + idx * quant_group_bytes;
             for (int i = 0; i < 16; i++) {
                 dst_q[i] = tmp[i] ^ 0x88;
             }
@@ -258,7 +295,11 @@ static void inpu_reformat_q4_0_set(struct ggml_tensor * tensor, const void * dat
     }
 }
 
-static void inpu_reformat_q4_0_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static void inpu_reformat_q4_0_get(const struct ggml_tensor * tensor,
+                                   void *                     data,
+                                   size_t                     offset,
+                                   size_t                     size,
+                                   bool                       groups_first_layout) {
     GGML_ASSERT(offset == 0);
 
     const int64_t n_rows = ggml_nrows(tensor);
@@ -283,11 +324,13 @@ static void inpu_reformat_q4_0_get(const struct ggml_tensor * tensor, void * dat
 
         for (int64_t b = 0; b < n_blocks_per_row; b++) {
             uint8_t * block = dst_row + b * block_size;
-            // Restore scale from groups-first layout: src[b * n_rows + row]
-            memcpy(block, src_scales + (b * n_rows + row) * sizeof(uint16_t), sizeof(uint16_t));
+            const size_t idx =
+                groups_first_layout ? (size_t) (b * n_rows + row) : (size_t) (row * n_blocks_per_row + b);
+
+            memcpy(block, src_scales + idx * sizeof(uint16_t), sizeof(uint16_t));
             // Reverse: XOR 0x88 to convert i4→u4, then repack OV → ggml nibble layout
             uint8_t tmp[16];
-            const uint8_t * src_q = src_quants + (b * n_rows + row) * quant_group_bytes;
+            const uint8_t * src_q = src_quants + idx * quant_group_bytes;
             for (int i = 0; i < 16; i++) {
                 tmp[i] = src_q[i] ^ 0x88;
             }
@@ -311,7 +354,11 @@ static void inpu_reformat_q4_0_get(const struct ggml_tensor * tensor, void * dat
 //   fp16 scales: n_blocks_per_row * n_rows * 2 bytes  [n_groups, N]
 // ---------------------------------------------------------------------------
 
-static void inpu_reformat_q8_0_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+static void inpu_reformat_q8_0_set(struct ggml_tensor * tensor,
+                                   const void *         data,
+                                   size_t               offset,
+                                   size_t               size,
+                                   bool                 groups_first_layout) {
     GGML_ASSERT(offset == 0);
 
     const int64_t n_rows = ggml_nrows(tensor);
@@ -336,17 +383,23 @@ static void inpu_reformat_q8_0_set(struct ggml_tensor * tensor, const void * dat
 
         for (int64_t b = 0; b < n_blocks_per_row; b++) {
             const uint8_t * block = src_row + b * block_size;
-            // Extract fp16 scale → dst[b * n_rows + row] (groups-first)
-            memcpy(dst_scales + (b * n_rows + row) * sizeof(uint16_t), block, sizeof(uint16_t));
+            const size_t    idx =
+                groups_first_layout ? (size_t) (b * n_rows + row) : (size_t) (row * n_blocks_per_row + b);
+
+            memcpy(dst_scales + idx * sizeof(uint16_t), block, sizeof(uint16_t));
             // Copy int8 quants directly (already signed) → groups-first
             const uint8_t * src_qs = block + sizeof(uint16_t);
-            uint8_t * dst_q = dst_quants + (b * n_rows + row) * 32;
+            uint8_t *       dst_q  = dst_quants + idx * 32;
             memcpy(dst_q, src_qs, 32);
         }
     }
 }
 
-static void inpu_reformat_q8_0_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+static void inpu_reformat_q8_0_get(const struct ggml_tensor * tensor,
+                                   void *                     data,
+                                   size_t                     offset,
+                                   size_t                     size,
+                                   bool                       groups_first_layout) {
     GGML_ASSERT(offset == 0);
 
     const int64_t n_rows = ggml_nrows(tensor);
@@ -369,10 +422,12 @@ static void inpu_reformat_q8_0_get(const struct ggml_tensor * tensor, void * dat
 
         for (int64_t b = 0; b < n_blocks_per_row; b++) {
             uint8_t * block = dst_row + b * block_size;
-            // Restore scale from groups-first layout: src[b * n_rows + row]
-            memcpy(block, src_scales + (b * n_rows + row) * sizeof(uint16_t), sizeof(uint16_t));
+            const size_t idx =
+                groups_first_layout ? (size_t) (b * n_rows + row) : (size_t) (row * n_blocks_per_row + b);
+
+            memcpy(block, src_scales + idx * sizeof(uint16_t), sizeof(uint16_t));
             // Copy int8 quants directly from groups-first layout
-            memcpy(block + sizeof(uint16_t), src_quants + (b * n_rows + row) * 32, 32);
+            memcpy(block + sizeof(uint16_t), src_quants + idx * 32, 32);
         }
     }
 }
@@ -389,63 +444,66 @@ static void ggml_backend_inpu_buffer_set_tensor(ggml_backend_buffer_t buffer,
     auto * buf_ctx = static_cast<ggml_backend_inpu_buffer_context *>(buffer->context);
     const bool    profile_enabled = inpu_debug_profile_enabled();
     const int64_t t_start_us      = profile_enabled ? ggml_time_us() : 0;
+    const bool    groups_first_layout = inpu_use_groups_first_quant_layout();
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0: {
-            inpu_reformat_q4_0_set(tensor, data, offset, size);
+                inpu_reformat_q4_0_set(tensor, data, offset, size, groups_first_layout);
 
-            const int64_t n_rows = ggml_nrows(tensor);
-            const int64_t n_cols = tensor->ne[0];
-            const int64_t n_blocks_per_row = n_cols / 32;
-            const size_t quants_bytes = (size_t)n_rows * ((size_t)n_cols / 2);
-            const size_t scales_bytes = (size_t)n_rows * (size_t)n_blocks_per_row * sizeof(uint16_t);
+                const int64_t n_rows           = ggml_nrows(tensor);
+                const int64_t n_cols           = tensor->ne[0];
+                const int64_t n_blocks_per_row = n_cols / 32;
+                const size_t  quants_bytes     = (size_t) n_rows * ((size_t) n_cols / 2);
+                const size_t  scales_bytes     = (size_t) n_rows * (size_t) n_blocks_per_row * sizeof(uint16_t);
 
-            auto extra = std::make_unique<ggml_inpu_tensor_extra>();
-            extra->quants       = tensor->data;
-            extra->scales       = static_cast<uint8_t *>(tensor->data) + quants_bytes;
-            extra->quants_bytes = quants_bytes;
-            extra->scales_bytes = scales_bytes;
-            extra->quant_ov_type = ov::element::i4;
-            extra->scale_ov_type = ov::element::f16;
-            extra->n_rows       = n_rows;
-            extra->n_cols       = n_cols;
-            extra->group_size   = 32;
-            extra->is_quantized = true;
+                auto extra                 = std::make_unique<ggml_inpu_tensor_extra>();
+                extra->quants              = tensor->data;
+                extra->scales              = static_cast<uint8_t *>(tensor->data) + quants_bytes;
+                extra->quants_bytes        = quants_bytes;
+                extra->scales_bytes        = scales_bytes;
+                extra->quant_ov_type       = ov::element::i4;
+                extra->scale_ov_type       = ov::element::f16;
+                extra->n_rows              = n_rows;
+                extra->n_cols              = n_cols;
+                extra->group_size          = 32;
+                extra->groups_first_layout = groups_first_layout;
+                extra->is_quantized        = true;
 
-            tensor->extra = extra.get();
-            {
-                std::lock_guard<std::mutex> lock(buf_ctx->extras_mutex);
-                buf_ctx->extras[tensor] = std::move(extra);
-            }
+                tensor->extra = extra.get();
+                {
+                    std::lock_guard<std::mutex> lock(buf_ctx->extras_mutex);
+                    buf_ctx->extras[tensor] = std::move(extra);
+                }
             break;
         }
 
         case GGML_TYPE_Q8_0: {
-            inpu_reformat_q8_0_set(tensor, data, offset, size);
+                inpu_reformat_q8_0_set(tensor, data, offset, size, groups_first_layout);
 
-            const int64_t n_rows = ggml_nrows(tensor);
-            const int64_t n_cols = tensor->ne[0];
-            const int64_t n_blocks_per_row = n_cols / 32;
-            const size_t quants_bytes = (size_t)n_rows * (size_t)n_cols;
-            const size_t scales_bytes = (size_t)n_rows * (size_t)n_blocks_per_row * sizeof(uint16_t);
+                const int64_t n_rows           = ggml_nrows(tensor);
+                const int64_t n_cols           = tensor->ne[0];
+                const int64_t n_blocks_per_row = n_cols / 32;
+                const size_t  quants_bytes     = (size_t) n_rows * (size_t) n_cols;
+                const size_t  scales_bytes     = (size_t) n_rows * (size_t) n_blocks_per_row * sizeof(uint16_t);
 
-            auto extra = std::make_unique<ggml_inpu_tensor_extra>();
-            extra->quants       = tensor->data;
-            extra->scales       = static_cast<uint8_t *>(tensor->data) + quants_bytes;
-            extra->quants_bytes = quants_bytes;
-            extra->scales_bytes = scales_bytes;
-            extra->quant_ov_type = ov::element::i8;
-            extra->scale_ov_type = ov::element::f16;
-            extra->n_rows       = n_rows;
-            extra->n_cols       = n_cols;
-            extra->group_size   = 32;
-            extra->is_quantized = true;
+                auto extra                 = std::make_unique<ggml_inpu_tensor_extra>();
+                extra->quants              = tensor->data;
+                extra->scales              = static_cast<uint8_t *>(tensor->data) + quants_bytes;
+                extra->quants_bytes        = quants_bytes;
+                extra->scales_bytes        = scales_bytes;
+                extra->quant_ov_type       = ov::element::i8;
+                extra->scale_ov_type       = ov::element::f16;
+                extra->n_rows              = n_rows;
+                extra->n_cols              = n_cols;
+                extra->group_size          = 32;
+                extra->groups_first_layout = groups_first_layout;
+                extra->is_quantized        = true;
 
-            tensor->extra = extra.get();
-            {
-                std::lock_guard<std::mutex> lock(buf_ctx->extras_mutex);
-                buf_ctx->extras[tensor] = std::move(extra);
-            }
+                tensor->extra = extra.get();
+                {
+                    std::lock_guard<std::mutex> lock(buf_ctx->extras_mutex);
+                    buf_ctx->extras[tensor] = std::move(extra);
+                }
             break;
         }
 
@@ -468,14 +526,15 @@ static void ggml_backend_inpu_buffer_get_tensor(ggml_backend_buffer_t buffer,
     GGML_UNUSED(buffer);
     const bool    profile_enabled = inpu_debug_profile_enabled();
     const int64_t t_start_us      = profile_enabled ? ggml_time_us() : 0;
+    const bool    groups_first_layout = inpu_use_groups_first_quant_layout();
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            inpu_reformat_q4_0_get(tensor, data, offset, size);
+            inpu_reformat_q4_0_get(tensor, data, offset, size, groups_first_layout);
             break;
 
         case GGML_TYPE_Q8_0:
-            inpu_reformat_q8_0_get(tensor, data, offset, size);
+            inpu_reformat_q8_0_get(tensor, data, offset, size, groups_first_layout);
             break;
 
         default:
@@ -522,29 +581,32 @@ static ggml_backend_buffer_t ggml_backend_inpu_buft_alloc_buffer(ggml_backend_bu
     std::unique_ptr<ov::intel_npu::level_zero::ZeroBufferTensor> l0_tensor;
 
     auto & rt = ggml_inpu_shared_runtime_ref();
+    const bool is_cpu = std::strcmp(inpu_get_target_device_kind(), "CPU") == 0;
 
     if (size > 0) {
         const size_t alignment = 64;
         size = (size + alignment - 1) & ~(alignment - 1);
 
-        try {
-            auto   remote_tensor  = rt.l0_context->create_l0_host_tensor(ov::element::u8, { size });
-            void * level_zero_ptr = remote_tensor.get();
+        if (!is_cpu && rt.l0_context) {
+            try {
+                auto   remote_tensor  = rt.l0_context->create_l0_host_tensor(ov::element::u8, { size });
+                void * level_zero_ptr = remote_tensor.get();
 
-            if (level_zero_ptr != nullptr) {
-                data             = level_zero_ptr;
-                is_l0_allocation = true;
-                l0_tensor = std::make_unique<ov::intel_npu::level_zero::ZeroBufferTensor>(std::move(remote_tensor));
-                INPU_LOG_DEBUG("allocated iNPU buffer with shared L0 host tensor (%zu bytes)\n", size);
+                if (level_zero_ptr != nullptr) {
+                    data             = level_zero_ptr;
+                    is_l0_allocation = true;
+                    l0_tensor = std::make_unique<ov::intel_npu::level_zero::ZeroBufferTensor>(std::move(remote_tensor));
+                    INPU_LOG_DEBUG("allocated iNPU buffer with shared L0 host tensor (%zu bytes)\n", size);
+                }
+            } catch (const std::exception & e) {
+                INPU_LOG_WARN("L0 host tensor allocation failed, falling back to aligned_alloc: %s\n", e.what());
             }
-        } catch (const std::exception & e) {
-            INPU_LOG_WARN("L0 host tensor allocation failed, falling back to aligned_alloc: %s\n", e.what());
         }
 
         if (!data) {
             data = aligned_alloc(alignment, size);
             if (data) {
-                INPU_LOG_DEBUG("allocated iNPU buffer with aligned_alloc fallback (%zu bytes)\n", size);
+                INPU_LOG_DEBUG("allocated iNPU buffer with aligned_alloc (%zu bytes)\n", size);
             }
         }
         if (!data) {
@@ -696,18 +758,28 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
         // 5. Compile for NPU
         try {
             const int64_t     t_compile_start_us = profile_enabled ? ggml_time_us() : 0;
-            static ov::AnyMap config = {
-                {"NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES" },
-                {"NPU_USE_NPUW",                      "YES" },
-                {"NPUW_ONLINE_PIPELINE",              "NONE"},
-            };
             auto * rt = ctx->runtime;
             if (!rt || !rt->core) {
                 INPU_LOG_ERROR("shared OV runtime is not initialized\n");
                 return finish(GGML_STATUS_FAILED);
             }
 
-            auto cm = rt->core->compile_model(result.model, *rt->l0_context, config);
+            ov::AnyMap config;
+            const bool is_npu = rt->device_name.find("NPU") != std::string::npos;
+            if (is_npu) {
+                config = {
+                    { "NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES" },
+                    { "NPU_USE_NPUW",                      "YES" },
+                    { "NPUW_DEVICES",                      "NPU" },
+                    { "NPUW_FOLD",                         "YES" },
+                    { "NPUW_FUNCALL_FOR_ALL",              "YES" },
+                    { "NPUW_FUNCALL_ASYNC",                "YES" },
+                };
+            }
+
+            ov::CompiledModel cm = (is_npu && rt->l0_context)
+                ? rt->core->compile_model(result.model, *rt->l0_context, config)
+                : rt->core->compile_model(result.model, rt->device_name, config);
 
             compiled = std::make_shared<inpu_compiled_graph>();
             compiled->compiled_model = std::make_shared<ov::CompiledModel>(std::move(cm));
@@ -917,7 +989,9 @@ static ggml_backend_t ggml_backend_inpu_init(void) {
         /* .context = */ ctx,
     };
 
-    INPU_LOG_INFO("initialized iNPU backend (device: %s)\n", ctx->runtime->device_name.c_str());
+    INPU_LOG_INFO("initialized iNPU backend (GGML_INPU_DEVICE=%s, OV device: %s, quant_layout=%s)\n",
+                  inpu_get_target_device_kind(), ctx->runtime->device_name.c_str(),
+                  inpu_use_groups_first_quant_layout() ? "groups-first" : "row-first");
     return backend;
 }
 

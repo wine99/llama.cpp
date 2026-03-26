@@ -553,8 +553,13 @@ void llama_context::synchronize() {
 
     // add the evaluation to the stats
     if (n_queued_tokens == 1) {
+        const int64_t t_eval_step_us = ggml_time_us() - t_compute_start_us;
+
         if (!cparams.no_perf) {
-            t_eval_us += ggml_time_us() - t_compute_start_us;
+            t_eval_us += t_eval_step_us;
+            if (n_eval == 0) {
+                t_eval_first_us = t_eval_step_us;
+            }
         }
         n_eval++;
     } else if (n_queued_tokens > 1) {
@@ -2505,6 +2510,7 @@ llama_perf_context_data llama_context::perf_get_data() const {
     data.t_load_ms   = 1e-3 * t_load_us;
     data.t_p_eval_ms = 1e-3 * t_p_eval_us;
     data.t_eval_ms   = 1e-3 * t_eval_us;
+    data.t_eval_first_ms = 1e-3 * t_eval_first_us;
     data.n_p_eval    = std::max(1, n_p_eval);
     data.n_eval      = std::max(1, n_eval);
     data.n_reused    = std::max(0, n_reused);
@@ -2515,6 +2521,7 @@ llama_perf_context_data llama_context::perf_get_data() const {
 void llama_context::perf_reset() {
     t_start_us  = ggml_time_us();
     t_eval_us   = n_eval = 0;
+    t_eval_first_us      = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
 }
@@ -3330,12 +3337,24 @@ void llama_perf_context_print(const llama_context * ctx) {
     const auto data = llama_perf_context(ctx);
 
     const double t_end_ms = 1e-3 * ggml_time_us();
+    const int32_t n_eval_no_first    = std::max(0, data.n_eval - 1);
+    const double  t_eval_no_first_ms = std::max(0.0, data.t_eval_ms - data.t_eval_first_ms);
 
     LLAMA_LOG_INFO("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
     LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
+    if (n_eval_no_first > 0) {
+        LLAMA_LOG_INFO(
+            "%s: eval time (1st token excluded) = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per "
+            "second)\n",
+            __func__, t_eval_no_first_ms, n_eval_no_first, t_eval_no_first_ms / n_eval_no_first,
+            1e3 / t_eval_no_first_ms * n_eval_no_first);
+    } else {
+        LLAMA_LOG_INFO("%s: eval time (1st token excluded) = %10.2f ms / %5d runs\n", __func__, t_eval_no_first_ms,
+                       n_eval_no_first);
+    }
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 }

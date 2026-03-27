@@ -939,32 +939,6 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_VIEW:
             return op->src[0] && ggml_inpu_tensor_in_inpu_buffer(op->src[0]);
 
-        case GGML_OP_RMS_NORM: {
-            // TODO correct but no perf gain
-            return false;
-            const struct ggml_tensor * src0 = op->src[0];
-            // Only support F32/F16 inputs, and not in-place
-            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
-            if (ggml_impl_is_view(op)) return false;
-            return true;
-        }
-
-        case GGML_OP_ROPE: {
-            // TODO correct but no perf gain
-            return false;
-            const struct ggml_tensor * src0 = op->src[0];
-            const struct ggml_tensor * src1 = op->src[1];
-            // Only F32/F16 data, I32 positions
-            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
-            if (src1->type != GGML_TYPE_I32) return false;
-            // Only support NORMAL and NEOX modes
-            const int mode = ((const int32_t *) op->op_params)[2];
-            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) return false;
-            // Reject in-place
-            if (ggml_impl_is_view(op)) return false;
-            return true;
-        }
-
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0]; // weights
             // const struct ggml_tensor * src1 = op->src[1]; // activations
@@ -992,18 +966,6 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
             if (op->src[0]->ne[2] > 128) return false;
             if (op->src[0]->ne[3] > 8) return false;
 
-            return true;
-        }
-
-        case GGML_OP_MUL: {
-            // TODO correct but no perf gain
-            return false;
-            const struct ggml_tensor * src0 = op->src[0];
-            const struct ggml_tensor * src1 = op->src[1];
-            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
-            if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) return false;
-            if (ggml_impl_is_view(op)) return false;
-            if (!ggml_inpu_has_npu_broadcast_shape(src0, src1)) return false;
             return true;
         }
 
@@ -1039,6 +1001,42 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
 
             if (!src1 && src0->ne[0] % 2 != 0) return false;
 
+            return true;
+        }
+
+        case GGML_OP_RMS_NORM: {
+            const struct ggml_tensor * src0 = op->src[0];
+            // Only support F32/F16 inputs, and not in-place
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
+            if (ggml_impl_is_view(op)) return false;
+            return true;
+        }
+
+        case GGML_OP_MUL: {
+            // TODO correct but no perf gain
+            return false;
+            const struct ggml_tensor * src0 = op->src[0];
+            const struct ggml_tensor * src1 = op->src[1];
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
+            if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) return false;
+            if (ggml_impl_is_view(op)) return false;
+            if (!ggml_inpu_has_npu_broadcast_shape(src0, src1)) return false;
+            return true;
+        }
+
+        case GGML_OP_ROPE: {
+            // TODO correct but no perf gain
+            return false;
+            const struct ggml_tensor * src0 = op->src[0];
+            const struct ggml_tensor * src1 = op->src[1];
+            // Only F32/F16 data, I32 positions
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return false;
+            if (src1->type != GGML_TYPE_I32) return false;
+            // Only support NORMAL and NEOX modes
+            const int mode = ((const int32_t *) op->op_params)[2];
+            if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) return false;
+            // Reject in-place
+            if (ggml_impl_is_view(op)) return false;
             return true;
         }
 

@@ -4,16 +4,14 @@
 // Registers as an ACCEL backend with a custom buffer type for weight preparation.
 
 #include "ggml-inpu.h"
-#include "ggml-inpu-impl.h"
+
+#include "ggml-backend-impl.h"
+#include "ggml-impl.h"
 #include "ggml-inpu-cache.h"
 #include "ggml-inpu-debug.h"
+#include "ggml-inpu-impl.h"
 #include "ggml-inpu-translate.h"
-
-#include "ggml-impl.h"
-#include "ggml-backend-impl.h"
 #include "ggml.h"
-
-#include <openvino/openvino.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -22,6 +20,8 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <openvino/openvino.hpp>
+#include <openvino/runtime/intel_npu/level_zero/level_zero.hpp>
 #include <string>
 #include <vector>
 
@@ -38,11 +38,66 @@
 // Backend context
 // ============================================================================
 
-struct ggml_inpu_context {
-    ov::Core core;
-    inpu_cache cache;
-    std::string device_name; // "NPU"
+struct ggml_inpu_shared_runtime {
+    std::mutex                                              mutex;
+    std::shared_ptr<ov::Core>                               core;
+    std::string                                             device_name = "NPU";
+    std::shared_ptr<ov::intel_npu::level_zero::ZeroContext> l0_context;
 };
+
+struct ggml_inpu_context {
+    ggml_inpu_shared_runtime * runtime;  // shared singleton, not owned
+    inpu_cache                 cache;
+};
+
+static ggml_inpu_shared_runtime & ggml_inpu_get_shared_runtime() {
+    static ggml_inpu_shared_runtime runtime;
+    return runtime;
+}
+
+static void ggml_inpu_init_shared_runtime() {
+    auto &                      runtime = ggml_inpu_get_shared_runtime();
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+
+    if (runtime.core) {
+        return;
+    }
+
+    runtime.core        = std::make_shared<ov::Core>();
+    runtime.device_name = "NPU";
+
+    try {
+        auto devices   = runtime.core->get_available_devices();
+        bool found_npu = false;
+        for (const auto & dev : devices) {
+            if (dev.find("NPU") != std::string::npos) {
+                found_npu           = true;
+                runtime.device_name = dev;
+                break;
+            }
+        }
+        if (!found_npu) {
+            INPU_LOG_WARN("no NPU device found in OpenVINO, available devices:");
+            for (const auto & dev : devices) {
+                INPU_LOG_WARN("  %s", dev.c_str());
+            }
+        }
+    } catch (const std::exception & e) {
+        INPU_LOG_ERROR("failed to enumerate OV devices: %s\n", e.what());
+    }
+
+    try {
+        auto l0 = runtime.core->get_default_context(runtime.device_name).as<ov::intel_npu::level_zero::ZeroContext>();
+        runtime.l0_context = std::make_shared<ov::intel_npu::level_zero::ZeroContext>(std::move(l0));
+    } catch (const std::exception & e) {
+        INPU_LOG_WARN("failed to create shared NPU Level Zero context: %s\n", e.what());
+    }
+}
+
+static ggml_inpu_shared_runtime & ggml_inpu_shared_runtime_ref() {
+    ggml_inpu_init_shared_runtime();
+    return ggml_inpu_get_shared_runtime();
+}
 
 // ============================================================================
 // Buffer type implementation
@@ -83,14 +138,17 @@ static size_t ggml_backend_inpu_buft_get_alloc_size(ggml_backend_buffer_type_t b
 struct ggml_backend_inpu_buffer_context {
     void * data;
     size_t size;
-    // Tensor extras stored here to manage lifetime
+    bool                                                         is_l0_allocation;
+    std::unique_ptr<ov::intel_npu::level_zero::ZeroBufferTensor> l0_tensor;  // keeps L0 allocation alive
     std::unordered_map<const struct ggml_tensor *, std::unique_ptr<ggml_inpu_tensor_extra>> extras;
     std::mutex extras_mutex;
 };
 
 static void ggml_backend_inpu_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<ggml_backend_inpu_buffer_context *>(buffer->context);
-    free(ctx->data);
+    if (!ctx->is_l0_allocation) {
+        free(ctx->data);
+    }
     delete ctx;
 }
 
@@ -460,17 +518,42 @@ static struct ggml_backend_buffer_i ggml_backend_inpu_buffer_i = {
 
 static ggml_backend_buffer_t ggml_backend_inpu_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * data = nullptr;
+    bool                                                         is_l0_allocation = false;
+    std::unique_ptr<ov::intel_npu::level_zero::ZeroBufferTensor> l0_tensor;
+
+    auto & rt = ggml_inpu_shared_runtime_ref();
+
     if (size > 0) {
         const size_t alignment = 64;
         size = (size + alignment - 1) & ~(alignment - 1);
-        data = aligned_alloc(alignment, size);
+
+        try {
+            auto   remote_tensor  = rt.l0_context->create_l0_host_tensor(ov::element::u8, { size });
+            void * level_zero_ptr = remote_tensor.get();
+
+            if (level_zero_ptr != nullptr) {
+                data             = level_zero_ptr;
+                is_l0_allocation = true;
+                l0_tensor = std::make_unique<ov::intel_npu::level_zero::ZeroBufferTensor>(std::move(remote_tensor));
+                INPU_LOG_DEBUG("allocated iNPU buffer with shared L0 host tensor (%zu bytes)\n", size);
+            }
+        } catch (const std::exception & e) {
+            INPU_LOG_WARN("L0 host tensor allocation failed, falling back to aligned_alloc: %s\n", e.what());
+        }
+
+        if (!data) {
+            data = aligned_alloc(alignment, size);
+            if (data) {
+                INPU_LOG_DEBUG("allocated iNPU buffer with aligned_alloc fallback (%zu bytes)\n", size);
+            }
+        }
         if (!data) {
             INPU_LOG_ERROR("failed to allocate %zu bytes for iNPU buffer\n", size);
             return nullptr;
         }
     }
 
-    auto * buf_ctx = new ggml_backend_inpu_buffer_context{data, size, {}, {}};
+    auto * buf_ctx = new ggml_backend_inpu_buffer_context{ data, size, is_l0_allocation, std::move(l0_tensor), {}, {} };
 
     return ggml_backend_buffer_init(buft, ggml_backend_inpu_buffer_i, buf_ctx, size);
 }
@@ -618,7 +701,13 @@ static enum ggml_status ggml_backend_inpu_graph_compute(ggml_backend_t backend, 
                 {"NPU_USE_NPUW",                      "YES" },
                 {"NPUW_ONLINE_PIPELINE",              "NONE"},
             };
-            auto cm = ctx->core.compile_model(result.model, ctx->device_name, config);
+            auto * rt = ctx->runtime;
+            if (!rt || !rt->core) {
+                INPU_LOG_ERROR("shared OV runtime is not initialized\n");
+                return finish(GGML_STATUS_FAILED);
+            }
+
+            auto cm = rt->core->compile_model(result.model, *rt->l0_context, config);
 
             compiled = std::make_shared<inpu_compiled_graph>();
             compiled->compiled_model = std::make_shared<ov::CompiledModel>(std::move(cm));
@@ -816,29 +905,7 @@ static ggml_guid_t ggml_backend_inpu_guid(void) {
 
 static ggml_backend_t ggml_backend_inpu_init(void) {
     auto * ctx = new ggml_inpu_context();
-    ctx->device_name = "NPU";
-
-    // Verify NPU is available
-    try {
-        auto devices = ctx->core.get_available_devices();
-        bool found_npu = false;
-        for (const auto & dev : devices) {
-            if (dev.find("NPU") != std::string::npos) {
-                found_npu = true;
-                ctx->device_name = dev;
-                break;
-            }
-        }
-        if (!found_npu) {
-            INPU_LOG_WARN("no NPU device found in OpenVINO, available devices:");
-            for (const auto & dev : devices) {
-                INPU_LOG_WARN("  %s", dev.c_str());
-            }
-            // Still create the backend — it will fail on compile_model
-        }
-    } catch (const std::exception & e) {
-        INPU_LOG_ERROR("failed to enumerate OV devices: %s\n", e.what());
-    }
+    ctx->runtime = &ggml_inpu_shared_runtime_ref();
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_inpu_guid(),
@@ -847,7 +914,7 @@ static ggml_backend_t ggml_backend_inpu_init(void) {
         /* .context = */ ctx,
     };
 
-    INPU_LOG_INFO("initialized iNPU backend (device: %s)\n", ctx->device_name.c_str());
+    INPU_LOG_INFO("initialized iNPU backend (device: %s)\n", ctx->runtime->device_name.c_str());
     return backend;
 }
 

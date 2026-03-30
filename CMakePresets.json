@@ -2,6 +2,17 @@
   "version": 4,
   "configurePresets": [
     {
+        "name": "inpu",
+        "generator": "Ninja",
+        "binaryDir": "${sourceDir}/build-${presetName}",
+        "cacheVariables": {
+            "CMAKE_BUILD_TYPE": "Release",
+            "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+            "GGML_INPU": "ON",
+            "OpenVINO_DIR": "/opt/intel/openvino/runtime/cmake"
+        }
+    },
+    {
         "name":  "base",
         "hidden": true,
         "generator":   "Ninja",

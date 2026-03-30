@@ -2015,6 +2015,13 @@ struct test_glu : public test_case {
             bool swapped = false)
         : op(op), type(type), ne_a(ne_a), v(v), swapped(swapped) {}
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (strcmp(ggml_backend_name(backend), "iNPU") == 0) {
+            return 1e-6;  // iNPU computes in fp16
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
         if (v & 1) {
@@ -2058,6 +2065,13 @@ struct test_glu_split : public test_case {
             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
             int v = 0)
         : op(op), type(type), ne_a(ne_a), v(v) {}
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (strcmp(ggml_backend_name(backend), "iNPU") == 0) {
+            return 1e-6;  // iNPU computes in fp16
+        }
+        return test_case::max_nmse_err(backend);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
@@ -2501,6 +2515,13 @@ struct test_rms_norm_mul_rope : public test_case {
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
                            bool set_rows = false, int mode = GGML_ROPE_TYPE_NORMAL)
         : ne(ne), eps(eps), multi_add(multi_add), set_rows(set_rows), mode(mode) {}
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (strcmp(ggml_backend_name(backend), "iNPU") == 0) {
+            return 1e-5;  // iNPU computes in fp16
+        }
+        return test_case::max_nmse_err(backend);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
@@ -2996,6 +3017,13 @@ struct test_bin_bcast : public test_case {
             bool perm1 = false, bool src_overlap = false)
         : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap) {}
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (strcmp(ggml_backend_name(backend), "iNPU") == 0) {
+            return 1e-6;  // iNPU computes in fp16
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         GGML_ASSERT(nf <= 16);
 
@@ -3358,6 +3386,13 @@ struct test_rms_norm : public test_case {
             float eps = 1e-6f,
             bool inplace = false)
         : type(type), ne(ne), v(v), eps(eps), inplace(inplace) {}
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (strcmp(ggml_backend_name(backend), "iNPU") == 0) {
+            return 1e-6;  // iNPU computes in fp16
+        }
+        return test_case::max_nmse_err(backend);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -4559,6 +4594,13 @@ struct test_rope : public test_case {
             int n_dims = 10, int mode = GGML_ROPE_TYPE_NORMAL, int n_ctx = 512, float fs = 1.0f,
             float ef = 0.0f, float af = 0.0f, bool ff = false, int v = 0, bool forward = true, bool inplace = false)
         : type(type), ne_a(ne_a), n_dims(n_dims), mode(mode), n_ctx(n_ctx), fs(fs), ef(ef), af(af), ff(ff), v(v), forward(forward), inplace(inplace) {}
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (strcmp(ggml_backend_name(backend), "iNPU") == 0) {
+            return 2e-2;
+        }
+        return test_case::max_nmse_err(backend);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;

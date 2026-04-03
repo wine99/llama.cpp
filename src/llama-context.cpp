@@ -440,6 +440,17 @@ void llama_context::sched_reserve() {
             const int il = std::stoi(n->name + prefix_len);
             ggml_backend_dev_t device_kv = model.dev_layer(il);
             if (device_fa != device_kv) {
+                // ACCEL backends (e.g. NPU, BLAS, AMX) are designed to work alongside the CPU
+                // backend and can access CPU memory directly — a device mismatch between an ACCEL
+                // device running FA and a CPU-hosted KV cache is expected, not a fallback.
+                const bool fa_is_accel = ggml_backend_dev_type(device_fa) == GGML_BACKEND_DEVICE_TYPE_ACCEL;
+                const bool kv_is_cpu   = ggml_backend_dev_type(device_kv) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                if (fa_is_accel && kv_is_cpu) {
+                    LLAMA_LOG_DEBUG("%s: layer %d: FA on ACCEL device %s with KV cache on CPU device %s — OK\n",
+                                    __func__, il, ggml_backend_dev_name(device_fa), ggml_backend_dev_name(device_kv));
+                    continue;
+                }
+
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the Flash Attention tensor "
                         "is assigned to device %s (usually due to missing support)\n",
                         __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_fa));
@@ -2099,11 +2110,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && strcmp(name, "norm") == 0) {
-                const auto & dev_layer = model.dev_layer(il);
-                for (const auto & backend : backends) {
-                    if (ggml_backend_get_device(backend.get()) == dev_layer) {
-                        if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                // only override when the current layer and the previous layer are on different devices —
+                // that's the only case where the scheduler might wrongly assign norm to the previous
+                // layer's device. when they share the same device (e.g. all on CPU with ACCEL backends),
+                // let the scheduler pick naturally so ACCEL backends can handle the op.
+                const auto & dev_cur       = model.dev_layer(il);
+                const bool   prev_same_dev = (il > 0) ? (model.dev_layer(il - 1) == dev_cur) : true;
+                if (!prev_same_dev) {
+                    for (const auto & backend : backends) {
+                        if (ggml_backend_get_device(backend.get()) == dev_cur) {
+                            if (ggml_backend_supports_op(backend.get(), cur)) {
+                                ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            }
                         }
                     }
                 }

@@ -6,6 +6,7 @@
 #include "ggml-inpu.h"
 
 #include "ggml-backend-impl.h"
+#include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-inpu-cache.h"
 #include "ggml-inpu-debug.h"
@@ -942,7 +943,7 @@ static void ggml_backend_inpu_device_get_memory(ggml_backend_dev_t dev, size_t *
 }
 
 static enum ggml_backend_dev_type ggml_backend_inpu_device_get_type(ggml_backend_dev_t dev) {
-    return GGML_BACKEND_DEVICE_TYPE_GPU;
+    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
     GGML_UNUSED(dev);
 }
 
@@ -1114,6 +1115,7 @@ static bool ggml_backend_inpu_device_supports_op(ggml_backend_dev_t dev, const s
 
         case GGML_OP_SET_ROWS:
             {
+                return false;
                 const struct ggml_tensor * src0 = op->src[0];  // source data
                 const struct ggml_tensor * src1 = op->src[1];  // indices
                 const struct ggml_tensor * src2 = op->src[2];  // destination

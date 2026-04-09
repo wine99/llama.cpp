@@ -348,6 +348,7 @@ private:
     mutable int64_t t_load_us   = 0;
     mutable int64_t t_p_eval_us = 0;
     mutable int64_t t_eval_us   = 0;
+    mutable int64_t t_eval_first_us = 0;
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;

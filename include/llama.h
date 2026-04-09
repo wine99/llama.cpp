@@ -1496,6 +1496,7 @@ extern "C" {
         double t_load_ms;   // time needed for loading the model
         double t_p_eval_ms; // time needed for processing the prompt
         double t_eval_ms;   // time needed for generating tokens
+        double t_eval_first_ms;  // time needed for the first generated token
 
         int32_t n_p_eval;   // number of prompt tokens
         int32_t n_eval;     // number of generated tokens

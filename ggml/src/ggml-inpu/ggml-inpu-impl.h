@@ -27,6 +27,7 @@ struct ggml_inpu_tensor_extra {
     int64_t n_rows;      // weight matrix rows
     int64_t n_cols;      // weight matrix cols
     int     group_size;  // quantization group size (32 for Q4_0/Q8_0)
+    bool    groups_first_layout;  // true for [n_groups, N, gs], false for [N, n_groups, gs]
 
     bool is_quantized;   // true for Q4_0/Q8_0, false for F16/F32
 };

@@ -257,16 +257,17 @@ static ov::Shape ggml_tensor_to_ov_shape(const struct ggml_tensor * t) {
 // Helper: translate a quantized weight to dequantized OV subgraph
 //
 // Creates two Parameters (quants + scales) and returns a dequantized f32 output.
-// During weight loading, u4/i8 quants are already converted to signed (i4/i8)
-// and permuted to groups-first layout:
-//   quants: [n_groups, N, group_size]  (i4 or i8)
-//   scales: [n_groups, N, 1]           (f16)
+// During weight loading, u4/i8 quants are converted to signed (i4/i8).
+// The backend can use one of two layouts:
+//   groups-first (NPU): quants [n_groups, N, group_size], scales [n_groups, N, 1]
+//   row-first (CPU/GPU): quants [N, n_groups, group_size], scales [N, n_groups, 1]
 //
-// NPU-optimal dequant pattern:
+// NPU-optimal dequant pattern (groups-first):
 //   [n_groups, N, gs] (Param, i4/i8) → Convert → f16 → Multiply → Transpose(1,0,2) → [N, n_groups, gs] → Reshape → [N, K]
 //   [n_groups, N, 1]  (Param, f16)   -------------------------->
 //
-// The formula is: Convert(i4/i8 → f16) * scale, transpose, reshape, then convert to f32.
+// CPU/GPU path (row-first) skips transpose and reshapes directly from [N, n_groups, gs] to [N, K].
+// The formula is: Convert(i4/i8 → f16) * scale, optional transpose, reshape, then convert to f32.
 // ============================================================================
 
 struct dequant_result {
@@ -292,33 +293,35 @@ static dequant_result create_dequant_subgraph(
 
     GGML_ASSERT(K % group_size == 0);
 
-    // Quant parameter: groups-first 3D layout [n_groups, N, group_size]
-    ov::Shape quant_shape = {n_groups, N, group_size};
+    const bool groups_first_layout = extra->groups_first_layout;
+
+    ov::Shape quant_shape =
+        groups_first_layout ? ov::Shape{ n_groups, N, group_size } : ov::Shape{ N, n_groups, group_size };
     result.quant_param = std::make_shared<ov::op::v0::Parameter>(extra->quant_ov_type, quant_shape);
     result.quant_param->set_friendly_name(quant_name);
     result.quant_param->output(0).set_names({quant_name});
 
-    // Scale parameter: groups-first 3D layout [n_groups, N, 1] — no Unsqueeze needed
-    ov::Shape scale_shape = {n_groups, N, 1};
+    ov::Shape scale_shape = groups_first_layout ? ov::Shape{ n_groups, N, 1 } : ov::Shape{ N, n_groups, 1 };
     result.scale_param = std::make_shared<ov::op::v0::Parameter>(extra->scale_ov_type, scale_shape);
     result.scale_param->set_friendly_name(scale_name);
     result.scale_param->output(0).set_names({scale_name});
 
-    // Convert quants to f16: [n_groups, N, gs]
+    // Convert quants to f16
     auto quant_f16 = std::make_shared<ov::op::v0::Convert>(result.quant_param, ov::element::f16);
 
-    // Multiply: [n_groups, N, gs] * [n_groups, N, 1] → [n_groups, N, gs] (broadcast on last dim)
+    // Multiply with scale (broadcast on last dim).
     auto dequant = std::make_shared<ov::op::v1::Multiply>(quant_f16, result.scale_param);
 
-    // Transpose: [n_groups, N, gs] → [N, n_groups, gs] via perm {1, 0, 2}
-    auto transpose_order = ov::op::v0::Constant::create(
-        ov::element::i64, {3}, std::vector<int64_t>{1, 0, 2});
-    auto dequant_transposed = std::make_shared<ov::op::v1::Transpose>(dequant, transpose_order);
+    ov::Output<ov::Node> dequant_3d = dequant;
+    if (groups_first_layout) {
+        auto transpose_order = ov::op::v0::Constant::create(ov::element::i64, { 3 }, std::vector<int64_t>{ 1, 0, 2 });
+        dequant_3d           = std::make_shared<ov::op::v1::Transpose>(dequant, transpose_order);
+    }
 
     // Reshape: [N, n_groups, gs] → [N, K]
     auto flat_shape = ov::op::v0::Constant::create(
         ov::element::i64, {2}, std::vector<int64_t>{(int64_t) N, (int64_t) K});
-    auto dequant_flat = std::make_shared<ov::op::v1::Reshape>(dequant_transposed, flat_shape, false);
+    auto dequant_flat = std::make_shared<ov::op::v1::Reshape>(dequant_3d, flat_shape, false);
 
     // Convert to f32 for computation
     auto dequant_f32 = std::make_shared<ov::op::v0::Convert>(dequant_flat, ov::element::f32);

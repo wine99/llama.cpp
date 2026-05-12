@@ -89,6 +89,8 @@ size_t checksum(const void * data, size_t size);
 
 bool save_ggml_tensor_data_to_txt(const ggml_tensor * tensor, const std::string & file_path);
 
+bool save_ov_tensor_data_to_txt(const std::string & name, const ov::Tensor & tensor, const std::string & file_path);
+
 void print_input_tensor_info(const std::string & name, const ov::Tensor & tensor);
 
 void print_output_tensor_info(const std::string & name, const ov::Tensor & tensor, const void * output_dst);

@@ -23,11 +23,11 @@ void ggml_openvino_device_config::init() {
         return;
     }
     device_name = getenv("GGML_OPENVINO_DEVICE") ? getenv("GGML_OPENVINO_DEVICE") : "CPU";
-    auto available_devices = ov_singleton_core().get_available_devices();
-    if (std::find(available_devices.begin(), available_devices.end(), device_name) == available_devices.end()) {
-        GGML_LOG_WARN("GGML OpenVINO Backend: device %s is not available, fallback to CPU\n", device_name.c_str());
-        device_name = "CPU";
-    }
+    // auto available_devices = ov_singleton_core().get_available_devices();
+    // if (std::find(available_devices.begin(), available_devices.end(), device_name) == available_devices.end()) {
+    //     GGML_LOG_WARN("GGML OpenVINO Backend: device %s is not available, fallback to CPU\n", device_name.c_str());
+    //     device_name = "CPU";
+    // }
     is_npu = (device_name == "NPU");
 
     auto * cache_dir = getenv("GGML_OPENVINO_CACHE_DIR");
@@ -35,7 +35,7 @@ void ggml_openvino_device_config::init() {
         compile_config = {
             {"NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES"   },
             {"NPU_USE_NPUW",                      "YES"   },
-            {"NPUW_DEVICES",                      "NPU"   },
+            {"NPUW_DEVICES",                      "CPU"   },
             {"NPUW_FOLD",                         "YES"   },
             {"NPUW_WEIGHTS_BANK",                 "shared"},
             {"NPUW_FUNCALL_FOR_ALL",              "YES"   },

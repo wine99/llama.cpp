@@ -135,12 +135,10 @@ ov::Tensor create_ov_output_tensor(std::shared_ptr<GgmlOvDecoder> ggml_decoder,
 
     if (ggml_tensor->extra != nullptr && !ggml_decoder->is_splited_model()) {
         auto * extra_base = static_cast<ggml_openvino_extra_base *>(ggml_tensor->extra);
-        if (extra_base->type != ggml_openvino_extra_base::Type::TENSOR) {
-            throw std::runtime_error("ggml tensor extra is not of type TENSOR for output: " +
-                                     std::string(ggml_tensor->name));
+        if (extra_base->type == ggml_openvino_extra_base::Type::TENSOR) {
+            auto * tensor_extra = static_cast<ggml_openvino_tensor_extra *>(extra_base);
+            return *tensor_extra->tensor;
         }
-        auto * tensor_extra = static_cast<ggml_openvino_tensor_extra *>(extra_base);
-        return *tensor_extra->tensor;
     }
 
     auto output_type = ggml_decoder->get_ov_type(ggml_tensor);
@@ -352,6 +350,75 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
             infer_request->set_output_tensor(i, output_tensor);
         }
 
+        // Dump reproducer data: IR + input binary files at the target step
+        if (getenv("GGML_OPENVINO_DUMP_REPRODUCER")) {
+            static int reproducer_step = 0;
+            int target_step = 2;  // step 2 is the first broken decode step
+            const char * step_env = getenv("GGML_OPENVINO_DUMP_REPRODUCER_STEP");
+            if (step_env) target_step = atoi(step_env);
+
+            if (reproducer_step == target_step) {
+                GGML_LOG_INFO("Dumping reproducer data at step %d\n", reproducer_step);
+                // Dump all input tensors as binary files
+                for (size_t i = 0; i < ov_input_names.size(); i++) {
+                    auto input_tensor = infer_request->get_input_tensor(i);
+                    char filename[512];
+                    snprintf(filename, sizeof(filename), "reproducer_input_%zu_%s.bin",
+                             i, ov_input_names[i].c_str());
+                    std::ofstream fout(filename, std::ios::binary);
+                    if (fout.is_open()) {
+                        // Write metadata: element type string, shape, then raw data
+                        auto et = input_tensor.get_element_type();
+                        auto shape = input_tensor.get_shape();
+                        std::string et_str = et.get_type_name();
+                        uint32_t et_len = et_str.size();
+                        uint32_t ndims = shape.size();
+                        fout.write(reinterpret_cast<const char *>(&et_len), sizeof(et_len));
+                        fout.write(et_str.c_str(), et_len);
+                        fout.write(reinterpret_cast<const char *>(&ndims), sizeof(ndims));
+                        for (auto d : shape) {
+                            uint64_t dim = d;
+                            fout.write(reinterpret_cast<const char *>(&dim), sizeof(dim));
+                        }
+                        // Handle remote tensors: copy to host first
+                        ov::Tensor host_tensor;
+                        try {
+                            (void)input_tensor.data();
+                            host_tensor = input_tensor;
+                        } catch (...) {
+                            host_tensor = ov::Tensor(et, shape);
+                            input_tensor.copy_to(host_tensor);
+                        }
+                        fout.write(static_cast<const char *>(host_tensor.data()),
+                                   host_tensor.get_byte_size());
+                        GGML_LOG_INFO("  Input %zu: %s, type=%s, shape=%s, bytes=%zu\n",
+                                      i, ov_input_names[i].c_str(),
+                                      et.get_type_name().c_str(),
+                                      shape.to_string().c_str(),
+                                      input_tensor.get_byte_size());
+                        // Also dump as txt
+                        char txt_filename[512];
+                        snprintf(txt_filename, sizeof(txt_filename), "reproducer_input_%zu_%s.txt",
+                                 i, ov_input_names[i].c_str());
+                        save_ov_tensor_data_to_txt(ov_input_names[i], host_tensor, txt_filename);
+                    }
+                }
+                // Dump output tensor shapes (for setting up output buffers in reproducer)
+                {
+                    std::ofstream meta("reproducer_meta.txt");
+                    meta << "n_inputs=" << ov_input_names.size() << "\n";
+                    meta << "n_outputs=" << ov_output_names.size() << "\n";
+                    for (size_t i = 0; i < ov_input_names.size(); i++) {
+                        meta << "input_" << i << "=" << ov_input_names[i] << "\n";
+                    }
+                    for (size_t i = 0; i < ov_output_names.size(); i++) {
+                        meta << "output_" << i << "=" << ov_output_names[i] << "\n";
+                    }
+                }
+            }
+            reproducer_step++;
+        }
+
         infer_request->infer();
         infer_end_time = ggml_time_us();
 
@@ -360,6 +427,60 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, std::shared_ptr<
                 const auto output_tensor = infer_request->get_output_tensor(i);
                 print_output_tensor_info(ov_output_names[i], output_tensor, output_tensor.data());
             }
+        }
+
+        if (getenv("GGML_OPENVINO_DUMP_KV_CACHE")) {
+            static int kv_dump_step = 0;
+            for (size_t i = 0; i < ov_output_names.size(); i++) {
+                const auto & name = ov_output_names[i];
+                if (name.find("cache_k") != std::string::npos || name.find("cache_v") != std::string::npos) {
+                    auto * ggml_out = ggml_decoder->get_model_outputs().at(name);
+                    // Read from the actual output tensor used by infer_request
+                    // This works for both host and remote tensors
+                    ov::Tensor ov_out = infer_request->get_output_tensor(i);
+                    ov::Shape ov_shape = ov_out.get_shape();
+
+                    // For remote tensors, copy to a host tensor first
+                    ov::Tensor host_tensor;
+                    try {
+                        // Try direct data access - works for host tensors
+                        (void)ov_out.data();
+                        host_tensor = ov_out;
+                    } catch (...) {
+                        // Remote tensor - create host copy
+                        host_tensor = ov::Tensor(ov_out.get_element_type(), ov_shape);
+                        ov_out.copy_to(host_tensor);
+                    }
+
+                    char filename[256];
+                    snprintf(filename, sizeof(filename), "kv_dump_step%04d_%s.txt", kv_dump_step, name.c_str());
+                    std::ofstream out(filename);
+                    if (out.is_open()) {
+                        out << "name: " << name
+                            << ", type: " << ggml_type_name(ggml_out->type)
+                            << ", shape: [" << ggml_out->ne[0] << "," << ggml_out->ne[1]
+                            << "," << ggml_out->ne[2] << "," << ggml_out->ne[3] << "]"
+                            << ", data:\n";
+                        out << std::setprecision(8);
+                        size_t n = host_tensor.get_size();
+                        auto elem_type = host_tensor.get_element_type();
+                        if (elem_type == ov::element::f16) {
+                            auto * data = host_tensor.data<ov::float16>();
+                            for (size_t j = 0; j < n; ++j) out << static_cast<float>(data[j]) << '\n';
+                        } else if (elem_type == ov::element::f32) {
+                            auto * data = host_tensor.data<float>();
+                            for (size_t j = 0; j < n; ++j) out << data[j] << '\n';
+                        } else if (elem_type == ov::element::bf16) {
+                            auto * data = host_tensor.data<ov::bfloat16>();
+                            for (size_t j = 0; j < n; ++j) out << static_cast<float>(data[j]) << '\n';
+                        }
+                    }
+                    GGML_LOG_INFO("Dumped KV cache: %s -> %s (type: %s, shape: %s)\n",
+                                  name.c_str(), filename, ggml_type_name(ggml_out->type),
+                                  ov_shape.to_string().c_str());
+                }
+            }
+            kv_dump_step++;
         }
 
         if (getenv("GGML_OPENVINO_PROFILING")) {
@@ -933,6 +1054,65 @@ size_t checksum(const void * data, size_t size) {
         sum += bytes[i];
     }
     return sum;
+}
+
+bool save_ov_tensor_data_to_txt(const std::string & name, const ov::Tensor & tensor, const std::string & file_path) {
+    std::ofstream out(file_path);
+    if (!out.is_open()) {
+        return false;
+    }
+
+    auto shape = tensor.get_shape();
+    size_t n = tensor.get_size();
+    out << "name: " << name
+        << ", type: " << tensor.get_element_type()
+        << ", shape: " << shape
+        << ", elements: " << n
+        << ", data:" << '\n';
+    out << std::setprecision(8);
+
+    switch (tensor.get_element_type()) {
+    case ov::element::f32: {
+        const auto * data = tensor.data<float>();
+        for (size_t i = 0; i < n; ++i) {
+            out << data[i] << '\n';
+        }
+        break;
+    }
+    case ov::element::f16: {
+        const auto * data = tensor.data<ov::float16>();
+        for (size_t i = 0; i < n; ++i) {
+            out << static_cast<float>(data[i]) << '\n';
+        }
+        break;
+    }
+    case ov::element::bf16: {
+        const auto * data = tensor.data<ov::bfloat16>();
+        for (size_t i = 0; i < n; ++i) {
+            out << static_cast<float>(data[i]) << '\n';
+        }
+        break;
+    }
+    case ov::element::i32: {
+        const auto * data = tensor.data<int32_t>();
+        for (size_t i = 0; i < n; ++i) {
+            out << data[i] << '\n';
+        }
+        break;
+    }
+    case ov::element::i64: {
+        const auto * data = tensor.data<int64_t>();
+        for (size_t i = 0; i < n; ++i) {
+            out << data[i] << '\n';
+        }
+        break;
+    }
+    default:
+        out << "unsupported tensor type for text dump" << '\n';
+        return false;
+    }
+
+    return true;
 }
 
 bool save_ggml_tensor_data_to_txt(const ggml_tensor * tensor, const std::string & file_path) {

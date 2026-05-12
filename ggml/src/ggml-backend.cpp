@@ -8,9 +8,9 @@
 #include <windows.h>
 #endif
 
-#include "ggml-backend.h"
-#include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-backend-impl.h"
+#include "ggml-backend.h"
 #include "ggml-impl.h"
 
 #include <assert.h>
@@ -19,7 +19,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #ifdef __APPLE__
@@ -932,6 +937,133 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     return -1;
 }
 
+static std::string ggml_backend_sched_dump_filename() {
+    const char * env = getenv("GGML_SCHED_DUMP_CGRAPH");
+    if (env == NULL || env[0] == '\0' || strcmp(env, "0") == 0) {
+        return {};
+    }
+
+    if (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "TRUE") == 0) {
+        static int dump_idx = 0;
+        char       filename[64];
+        snprintf(filename, sizeof(filename), "cgraph_sched_%03d.txt", dump_idx++);
+        return filename;
+    }
+
+    return env;
+}
+
+static const char * ggml_backend_sched_backend_name(ggml_backend_sched_t sched, int backend_id) {
+    if (backend_id < 0 || backend_id >= sched->n_backends) {
+        return "unassigned";
+    }
+    return ggml_backend_name(sched->backends[backend_id]);
+}
+
+static std::string ggml_backend_sched_supported_backends(ggml_backend_sched_t sched, const struct ggml_tensor * node) {
+    std::ostringstream supported;
+    bool               first = true;
+    for (int i = 0; i < sched->n_backends; i++) {
+        if (!ggml_backend_supports_op(sched->backends[i], node)) {
+            continue;
+        }
+        if (!first) {
+            supported << ',';
+        }
+        supported << ggml_backend_name(sched->backends[i]);
+        first = false;
+    }
+    return first ? std::string("-") : supported.str();
+}
+
+static void ggml_backend_sched_dump_cgraph(ggml_backend_sched_t       sched,
+                                           const struct ggml_cgraph * graph,
+                                           const std::string &        filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        GGML_LOG_WARN("%s: failed to open %s\n", __func__, filename.c_str());
+        return;
+    }
+
+    file << "=== GRAPH BEFORE SPLIT ===\n";
+    file << "n_backends = " << sched->n_backends << "\n";
+    for (int i = 0; i < sched->n_backends; i++) {
+        file << "  [" << i << "] " << ggml_backend_name(sched->backends[i]) << "\n";
+    }
+
+    file << "n_nodes = " << graph->n_nodes << "\n";
+    file << " " << std::setw(3) << "idx" << std::setw(15) << "shape" << std::setw(20) << "op" << std::setw(36) << "name"
+         << std::setw(26) << "assigned_backend" << std::setw(24) << "buffer_type" << " supported_backends\n";
+
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct ggml_tensor * node     = graph->nodes[i];
+        const char *               buf_name = "none";
+        ggml_backend_buffer_t      buf      = node->view_src ? node->view_src->buffer : node->buffer;
+        if (buf != NULL) {
+            buf_name = ggml_backend_buffer_name(buf);
+        }
+
+        const size_t hash_pos   = ggml_hash_find(&sched->hash_set, node);
+        const int    backend_id = hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(sched->hash_set.used, hash_pos) ?
+                                      sched->hv_tensor_backend_ids[hash_pos] :
+                                      -1;
+
+        file << " - " << std::setw(3) << i << ": [ " << std::setw(5) << node->ne[0] << ", " << std::setw(5)
+             << node->ne[1] << ", " << std::setw(5) << node->ne[2] << ", " << std::setw(5) << node->ne[3] << "] "
+             << std::left << std::setw(20) << ggml_op_name(node->op) << std::right << ' ' << std::left << std::setw(36)
+             << node->name << std::right << std::setw(26) << ggml_backend_sched_backend_name(sched, backend_id)
+             << std::setw(24) << buf_name << ' ' << ggml_backend_sched_supported_backends(sched, node) << "\n";
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const struct ggml_tensor * src = node->src[j];
+            if (src == NULL) {
+                continue;
+            }
+
+            const char *          src_buf_name = "none";
+            ggml_backend_buffer_t src_buf      = src->view_src ? src->view_src->buffer : src->buffer;
+            if (src_buf != NULL) {
+                src_buf_name = ggml_backend_buffer_name(src_buf);
+            }
+
+            const size_t src_hash_pos = ggml_hash_find(&sched->hash_set, src);
+            const int    src_backend_id =
+                src_hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(sched->hash_set.used, src_hash_pos) ?
+                       sched->hv_tensor_backend_ids[src_hash_pos] :
+                       -1;
+
+            file << std::setw(10) << " [ " << std::setw(5) << src->ne[0] << ", " << std::setw(5) << src->ne[1] << ", "
+                 << std::setw(5) << src->ne[2] << ", " << std::setw(5) << src->ne[3] << "] " << std::setw(2) << j
+                 << ": " << std::left << std::setw(16) << ggml_op_name(src->op) << std::right << std::left
+                 << std::setw(30) << src->name << std::right << std::setw(26)
+                 << ggml_backend_sched_backend_name(sched, src_backend_id) << std::setw(24) << src_buf_name << ' '
+                 << ggml_backend_sched_supported_backends(sched, src) << "\n";
+        }
+    }
+
+    file << "n_leafs = " << graph->n_leafs << "\n";
+    for (int i = 0; i < graph->n_leafs; i++) {
+        const struct ggml_tensor * leaf          = graph->leafs[i];
+        const char *               leaf_buf_name = "none";
+        ggml_backend_buffer_t      leaf_buf      = leaf->view_src ? leaf->view_src->buffer : leaf->buffer;
+        if (leaf_buf != NULL) {
+            leaf_buf_name = ggml_backend_buffer_name(leaf_buf);
+        }
+
+        const size_t hash_pos   = ggml_hash_find(&sched->hash_set, leaf);
+        const int    backend_id = hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(sched->hash_set.used, hash_pos) ?
+                                      sched->hv_tensor_backend_ids[hash_pos] :
+                                      -1;
+
+        file << " - " << std::setw(3) << i << ": [ " << std::setw(5) << leaf->ne[0] << ", " << std::setw(5)
+             << leaf->ne[1] << ", " << std::setw(5) << leaf->ne[2] << ", " << std::setw(5) << leaf->ne[3] << "] "
+             << std::left << std::setw(20) << ggml_op_name(leaf->op) << std::right << ' ' << std::left << std::setw(36)
+             << ggml_get_name(leaf) << std::right << std::setw(26) << ggml_backend_sched_backend_name(sched, backend_id)
+             << std::setw(24) << leaf_buf_name << ' ' << ggml_backend_sched_supported_backends(sched, leaf) << "\n";
+    }
+
+    file << "========================================\n";
+}
 static char * fmt_size(size_t size) {
     static char buffer[128];
     if (size >= 1024*1024) {
@@ -1031,6 +1163,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     graph->uid = ggml_graph_next_uid();
+    // if (const std::string dump_filename = ggml_backend_sched_dump_filename(); !dump_filename.empty()) {
+    //     ggml_backend_sched_dump_cgraph(sched, graph, dump_filename);
+    // }
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -1041,6 +1176,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf);
         }
     }
+
+    // if (const std::string dump_filename = ggml_backend_sched_dump_filename(); !dump_filename.empty()) {
+    //     ggml_backend_sched_dump_cgraph(sched, graph, dump_filename);
+    // }
 
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
@@ -1240,6 +1379,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
+    }
+
+    if (const std::string dump_filename = ggml_backend_sched_dump_filename(); !dump_filename.empty()) {
+        ggml_backend_sched_dump_cgraph(sched, graph, dump_filename);
     }
 
     // pass 5: split graph, find tensors that need to be copied

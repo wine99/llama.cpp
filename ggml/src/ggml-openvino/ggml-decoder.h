@@ -290,6 +290,7 @@ public:
         return op->op == GGML_OP_ROPE && tensor == op->src[2];
     }
 
+    // also returns true for cache_s and cache_r in SSM/DeltaNet models
     inline static bool is_kvcache(const ggml_tensor * tensor, const ggml_tensor * op) {
         return tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY ||
                (op != nullptr && op->op == GGML_OP_SET_ROWS && op->src[2] == tensor);

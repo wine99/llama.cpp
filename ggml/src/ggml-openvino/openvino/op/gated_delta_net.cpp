@@ -67,16 +67,16 @@ OutputVector translate_gated_delta_net(const NodeContext & context) {
     g = std::make_shared<ov::op::v0::Squeeze>(g, ov::op::v0::Constant::create(ov::element::i64, {1}, {3}));
     beta = std::make_shared<ov::op::v0::Squeeze>(beta, ov::op::v0::Constant::create(ov::element::i64, {1}, {3}));
 
-    std::cout << "GatedDeltaNet input shapes: q=" << q.get_partial_shape() << ", k=" << k.get_partial_shape()
-              << ", v=" << v.get_partial_shape() << ", g=" << g.get_partial_shape()
-              << ", beta=" << beta.get_partial_shape() << ", state=" << state.get_partial_shape() << std::endl;
+    // std::cout << "GatedDeltaNet input shapes: q=" << q.get_partial_shape() << ", k=" << k.get_partial_shape()
+    //           << ", v=" << v.get_partial_shape() << ", g=" << g.get_partial_shape()
+    //           << ", beta=" << beta.get_partial_shape() << ", state=" << state.get_partial_shape() << std::endl;
 
     auto gdn = std::make_shared<ov::op::internal::GatedDeltaNet>(q, k, v, state, g, beta);
     auto attn_4d = gdn->output(0);
     auto state_4d = gdn->output(1);  // [B, H_v, key_dim, value_dim]
 
-    std::cout << "GatedDeltaNet output shapes: attn=" << gdn->output(0).get_partial_shape()
-              << ", new_state=" << gdn->output(1).get_partial_shape() << std::endl;
+    // std::cout << "GatedDeltaNet output shapes: attn=" << gdn->output(0).get_partial_shape()
+    //           << ", new_state=" << gdn->output(1).get_partial_shape() << std::endl;
 
     // Transpose output state back to ggml layout [B, H_v, value_dim, key_dim]
     auto state_transposed = std::make_shared<ov::op::v1::Transpose>(state_4d, state_perm);

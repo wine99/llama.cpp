@@ -62,6 +62,17 @@
             "CMAKE_CXX_COMPILER": "g++"
         }
     },
+    {
+        "name": "ovgpu-base",
+        "hidden": true,
+        "cacheVariables": {
+            "GGML_OVGPU": "ON",
+            "OpenVINO_DIR": "/home/zijun/dev/openvino/build/install/Release/runtime/cmake",
+            "GGML_OVGPU_OV_SOURCE_DIR": "/home/zijun/dev/openvino"
+        }
+    },
+    { "name": "x64-linux-ovgpu-release", "inherits": [ "base", "x64-linux-gcc", "release", "ovgpu-base" ] },
+    { "name": "x64-linux-ovgpu-debug", "inherits": [ "base", "x64-linux-gcc", "debug", "ovgpu-base" ] },
     { "name": "x64-linux-gcc-debug", "inherits": [ "base", "x64-linux-gcc", "debug" ] },
     { "name": "x64-linux-gcc-release", "inherits": [ "base", "x64-linux-gcc", "release" ] },
     { "name": "x64-linux-gcc-reldbg", "inherits": [ "base", "x64-linux-gcc", "reldbg" ] },

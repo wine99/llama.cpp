@@ -1,11 +1,22 @@
 # PoC: dedicated OpenVINO GPU backend for ggml (eager, clDNN-level)
 
-Status: M1 in progress. M0 complete (skeleton + build + FC smoke test passing).
-MUL_MAT done: 65/65 supported cases pass (f32/f16/bf16 weights x f32/f16 act,
-weight 2D, batched activation). Grouped-weight (GQA) / quantized deferred.
-PERF CAVEAT: f16/bf16 weights are upcast to f32 per compute on UHD 770
-(supports_immad=0, no oneDNN); native-weight baking is M2. Worktree: llama.cpp-ovgpu,
-branch poc-ov-gpu-backend (base: dev_backend_openvino). Detailed log: WORKLOG.md.
+Status: M1 in progress on Lunar Lake - MUL_MAT, ADD/MUL, RMS_NORM, SOFT_MAX (basic),
+GET_ROWS all landed and passing (see WORKLOG for per-op pass counts). M0 + build
+wired. Detailed log: WORKLOG.md, short status + next steps: STATUS.md. Worktree:
+llama.cpp-ovgpu, branch poc-ov-gpu-backend (base: dev_backend_openvino).
+
+MUL_MAT: 116/116 supported cases pass (f32/f16/bf16 weights x f32/f16/bf16 act, weight
+2D, batched activation, incl. non-contiguous `k_v` sub-box views). The clDNN **oneDNN**
+FC path is engaged and correct on Lunar Lake (Xe2, supports_immad=1): f16/bf16 weights
+run NATIVE via downcast-act (activation reordered to the weight's dtype; oneDNN
+f16/bf16 matmul accumulates in f32 = matches ggml). 0 failures, clean exit, oneDNN FC
+selected (OVGPU_FC_TRACE). Mixed *storage-class* dtypes fall back to both-to-f32
+(oneDNN f32f32); non-immad devices keep both-to-f32 (ocl bfyx_ref). Grouped-weight
+(GQA) / quantized deferred (M2). ADD/MUL/RMS_NORM/GET_ROWS now also support their
+non-contiguous test variants (permuted operands for ADD/MUL, padded sub-box views
+for RMS_NORM/MUL_MAT/GET_ROWS) - every `v=0`/`v=1`-equivalent pair behaves
+identically; see WORKLOG's 2026-08-03 entry for the general "strided view"
+mechanism. Builds: OV (minimal GPU+onednn-gpu+core, Ninja+ccache) + llama.cpp (ovgpu preset).
 
 ## Goal
 
@@ -31,6 +42,43 @@ kernels) and kernel selection logic inside ggml's eager execution model.
    share_usm/attach_memory; outputs bound via `network::set_output_memory`.
 5. **Skeleton**: copy ggml-cann (complete GPU iface + external-lib CMake pattern),
    NOT the legacy ggml-openvino backend.
+
+## Device-class / DPAS target matrix
+
+The backend's perf path is gated on `supports_immad` - the cldnn device flag meaning
+"this GPU has a hardware matrix engine (XMX/**DPAS**) AND oneDNN has a code generator
+for it." Set from OpenCL `CL_DEVICE_FEATURE_FLAG_DPAS_INTEL` (OCL rt) or the L0 DPAS
+module flag, **and** ngen recognizing the arch family. DPAS does f16×f16->f32 (and
+i8×i8->i32) accumulate in hardware - this is why the native f16 path accumulates in f32
+matching ggml. The cldnn device table (device.cpp:97-109) per family:
+
+```
+gfx_ver          arch        DPAS(f16/i8)   device_id                supports_immad
+12.0-12.9        XeLP        -              TGL/RKL/ADL iGPU         NO  (old client iGPU)
+12.55-12.57      XeHPG(DG2)  128/256        Alchemist (Arc A)        YES
+12.70-12.71      XeHP        -              MTL/ARL-S iGPU           NO  (old client iGPU)
+12.74            XeHPG       128/256        ARL-H                    YES
+20.1-20.2        Xe2 (BMG)   128/256        Arc B580/B570 (Battlemage) YES
+20.4             Xe2 (LNL)   128/256        Lunar Lake (current dev)  YES
+30.0-30.1        Xe3/PTL     128/256        Panther Lake             YES
+```
+
+**Target**: functional + performant on all DPAS-capable client AND server GPUs:
+- Client: Arc A (Alchemist), Arc B (Battlemage, e.g. B580), Lunar Lake, Panther Lake.
+- Server: Data Center GPU Flex (Arctic Sound), Data Center GPU Max (Ponte Vecchio).
+All of these are DPAS-capable -> `supports_immad=1` -> identical oneDNN FC path
+(downcast-act native f16). The backend needs no per-device special-casing.
+
+**Perf path**: supports_immad -> oneDNN FC, native f16/bf16 via downcast-act.
+**Correctness safety net**: !supports_immad (old XeLP/MTL iGPU) -> both-to-f32,
+ocl bfyx_ref scalar kernel. Correct, slower. Acceptable: no server GPU we target is
+non-DPAS; this only affects legacy client iGPUs.
+
+**Caveat - XeHPC/Ponte Vecchio**: the OV/clDNN build in this worktree THROWS on
+`ngen::HW::XeHPC` (`ocl_device.cpp:63`: "XeHPC is not supported") at arch detection,
+even though the oneDNN engine lists PVC as supported. An OV-version issue, NOT the
+backend's - a PVC-aware ngen/OV build would handle it. Separate investigation if
+datacenter PVC is a hard requirement; Arc/Flex/Max (non-XeHPC) are unaffected.
 
 ## Architecture tiers (A is bring-up, B/C are end-state)
 
@@ -74,9 +122,12 @@ there as soon as it is implemented, in every milestone, before relying on it in
 model-level tools.
 
 1. **M1 - dense fp16/bf16**: llama-simple, llama-bench (varying context depth),
-   llama-perplexity. Op set: MUL_MAT (fully_connected), ADD/MUL, RMS_NORM (rms),
-   ROPE (rope), SDPA (scaled_dot_product_attention), SOFT_MAX, GET_ROWS,
-   CPY/SET_ROWS (KV cache), views/reshape as no-ops or layout ops.
+   llama-perplexity. Op set: MUL_MAT (fully_connected) [done], ADD/MUL [done],
+   RMS_NORM (rms) [done], SOFT_MAX (basic case) [done], GET_ROWS (gather) [done],
+   ROPE (rope) [deferred - see WORKLOG], SDPA (scaled_dot_product_attention)
+   [sync point, see below], CPY/SET_ROWS (KV cache), views/reshape as no-ops
+   [done - VIEW/RESHAPE/PERMUTE/TRANSPOSE all return true/no-op in supports_op
+   and graph_compute].
 2. **M2 - dense quantized**: same three tools; quantization scheme TBD (ggml block
    quants do not map to OV u4/i4; options: dequant at load, custom dequant op,
    or ggml extra-buft-style load-time conversion - separate discussion).
@@ -169,3 +220,71 @@ Verification:
 - oneDNN vs ocl FC impl selection per shape (force vs default heuristics).
 - Runtime engine: OCL vs Level Zero default per build (leave default initially).
 - Backend name: ggml-ovgpu?
+
+## Custom-kernel strategy: custom_gpu + ggml-opencl kernel reuse
+
+For ops that don't map cleanly to a cldnn primitive, inject a custom OpenCL kernel
+via `cldnn::custom_gpu_primitive` (same cldnn engine + USM memory - no runtime mix).
+
+**API** (`custom_gpu_primitive.hpp`): `(id, inputs, kernels_code[], entry_point,
+kernel_arguments[], build_options, output_layouts[], gws, lws)`. `kernels_code` is a
+vector of source strings; cldnn JIT-compiles via `clBuildProgram`. `kernel_arguments`
+binds `arg_input`/`arg_output` (memory pointers) / `arg_internal` (scratch buffer,
+sized by `size_expr`). **There is NO scalar-argument mechanism** - verified in
+`custom_primitive.cpp:206-220` (`arg_desc` is only input/output/internal-buffer).
+
+**The binding gap + bridge**: the ggml-opencl kernels (`kernels/*.cl`) are *generic* -
+they take ~18 scalar args (dims + byte strides `nb*`). cldnn's binding passes only
+memory pointers. Bridge:
+1. **Bake every scalar as a `-D` build option** (`-DR=.. -DNE0=.. -DNE1=.. ...`). OK
+   because the backend's op_cache is shape-keyed (one compiled network per shape) and
+   cldnn's `kernels_cache` caches the compiled binary by (source + build_options).
+2. **Force a contiguous layout**: the kernel receives raw pointers, so it can't know
+   padding/strides. Bind via `ggml_layout_for` (flat) and **pre-compact** any
+   non-contiguous input with a `cldnn::reorder` before the custom node (same pattern
+   MUL_MAT/RMS_NORM/eltwise/CPY already use). Contiguous inputs (the common case) are
+   zero-copy (raw pointer into the existing buffer) - no reorder, no overhead.
+
+**Cost of pre-compaction**: transient device buffer + O(N) bandwidth, but ONLY for
+non-contiguous views; contiguous inputs pay nothing. Compact-then-dense is usually
+*faster* than a strided kernel (coalesced reads). `optimize_data(true)` may fuse/merge
+reorders across the topology.
+
+**Reuse, not rewrite**: the ggml-opencl kernels are OpenCL = cldnn's runtime, so the
+kernel *logic* is ported verbatim; only the argument plumbing changes (scalars -> `-D`,
+assume contiguous). Confirmed ready kernels: `set_rows.cl` (f32/f16 + i32/i64 + q4_0/
+q8_0), `rope.cl`, `flash_attn_f16.cl` (which **does** handle ALiBi `max_bias` +
+`logit_softcap` + mask - so ALiBi/softcap attention can stay on GPU via custom_gpu
+instead of ggml-cpu). Embed the (adapted) source as a C++ string literal; cldnn JITs it.
+
+**Ops this applies to**:
+- **SET_ROWS**: batched per-group row scatter - `scatter_update` can't express per-group
+  indices (uniform indices across non-axis dims). custom_gpu + a ~20-line contiguous
+  kernel handles all batched/broadcast cases natively (the kernel does `i2%NE11`).
+- **ROPE** with YaRN/ext-factors: cldnn `rope` needs precomputed cos/sin (positions are
+  runtime, so can't be a static `data()` table). custom_gpu + `rope.cl` computes cos/sin
+  inline from freq_base+positions, matching ggml exactly (all modes + YaRN). Base
+  NEOX/NORMAL could also use cldnn `rope` + a cos/sin precompute graph.
+- **FLASH_ATTN_EXT** ALiBi/softcap: cldnn SDPA has no ALiBi/softcap. custom_gpu +
+  `flash_attn_f16.cl` (which has `get_alibi_slope` + `logit_softcap`). Base case uses
+  native cldnn SDPA (is_causal or ATTN_MASK input; sinks supported natively).
+
+## Caching layers: cldnn kernels_cache vs backend op_cache
+
+Two complementary caches at different layers (do NOT collapse them):
+
+- **cldnn `kernels_cache`** (`impls/ocl/kernels_cache.hpp`): per-engine cache of
+  *compiled OpenCL kernels* (`_cached_kernels`, `_cached_binaries`, disk cache). The
+  expensive `clBuildProgram` JIT is memoized globally per engine - re-creating a network
+  that uses the same kernel is a lookup, not a recompile.
+- **backend `op_cache`** (`ggml-ovgpu-ops.cpp`): caches the *constructed `cldnn::network`*
+  + backend metadata (`layout_for`, input/output ids), keyed by op+types+ne+nb. cldnn
+  does NOT cache network construction (program build + shape inference `calc_output_layout`
+  + impl selection `create()` + `layout_optimizer` + `primitive_inst` alloc) - that runs
+  every `cldnn::network(engine, topo, config)`. The backend cache amortizes it across
+  repeated shapes (transformer blocks) + tokens; on a hit only bind+execute remain.
+
+Keep the backend cache (complementary, not redundant); its only cost is memory (held
+networks) -> add an LRU cap (byte/entry budget) to bound growth (later task). A future
+bigger step: build one cldnn network per ggml *subgraph* (let cldnn fuse across ops),
+which would shift caching to the graph level.

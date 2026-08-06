@@ -67,8 +67,10 @@
         "hidden": true,
         "cacheVariables": {
             "GGML_OVGPU": "ON",
-            "OpenVINO_DIR": "/home/zijun/dev/openvino/build/install/Release/runtime/cmake",
-            "GGML_OVGPU_OV_SOURCE_DIR": "/home/zijun/dev/openvino"
+            "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+            "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+            "OpenVINO_DIR": "/home/zijunyu/llama.cpp-ovgpu/openvino/build/Release",
+            "GGML_OVGPU_OV_SOURCE_DIR": "/home/zijunyu/llama.cpp-ovgpu/openvino"
         }
     },
     { "name": "x64-linux-ovgpu-release", "inherits": [ "base", "x64-linux-gcc", "release", "ovgpu-base" ] },

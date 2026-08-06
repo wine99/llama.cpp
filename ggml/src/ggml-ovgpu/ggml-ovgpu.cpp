@@ -74,17 +74,22 @@ static void ggml_backend_ovgpu_buffer_set_tensor(ggml_backend_buffer_t buffer, g
     ggml_backend_ovgpu_buffer_context * ctx = (ggml_backend_ovgpu_buffer_context *) buffer->context;
     ggml_backend_ovgpu_reg_context * reg_ctx = ((ggml_backend_ovgpu_buffer_type_context *) buffer->buft->context)->reg_ctx;
     size_t dev_off = (char *) tensor->data - (char *) ctx->base + offset;
-    // mem_lock read_write: read current buffer (preserve other tensors), patch our region, write back.
-    cldnn::mem_lock<uint8_t, cldnn::mem_lock_type::read_write> lock(ctx->mem, *reg_ctx->stream);
-    memcpy((uint8_t *) lock.data() + dev_off, data, size);
+    // Direct device write of ONLY this tensor's bytes. copy_from(stream, src, src_off,
+    // dst_off, size) does a clEnqueueMemcpyINTEL of `size` bytes at dev_off - O(size),
+    // not O(buffer). (buffer_clear uses the same path safely.)
+    // Previously this used mem_lock<read_write> over the ENTIRE model buffer per
+    // tensor -> full device->host->device round-trip of ~2GB per weight tensor ->
+    // 100+ s model load. copy_from touches only the tensor's region.
+    ctx->mem->copy_from(*reg_ctx->stream, data, 0, dev_off, size, true /*blocking*/);
 }
 
 static void ggml_backend_ovgpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_ovgpu_buffer_context * ctx = (ggml_backend_ovgpu_buffer_context *) buffer->context;
     ggml_backend_ovgpu_reg_context * reg_ctx = ((ggml_backend_ovgpu_buffer_type_context *) buffer->buft->context)->reg_ctx;
     size_t dev_off = (char *) tensor->data - (char *) ctx->base + offset;
-    cldnn::mem_lock<uint8_t, cldnn::mem_lock_type::read> lock(ctx->mem, *reg_ctx->stream);
-    memcpy(data, (uint8_t *) lock.data() + dev_off, size);
+    // Direct device read of only this tensor's bytes (copy_to = copy_from into the
+    // host ptr). Avoids locking/mapping the whole buffer.
+    ctx->mem->copy_to(*reg_ctx->stream, data, dev_off, 0, size, true /*blocking*/);
 }
 
 static void ggml_backend_ovgpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -169,8 +174,11 @@ static enum ggml_status ggml_backend_ovgpu_graph_compute(ggml_backend_t backend,
     ggml_backend_ovgpu_context * ctx = (ggml_backend_ovgpu_context *) backend->context;
     cldnn::engine & engine = *ctx->reg_ctx->engine;
     ctx->op_cache.engine = &engine;
-    // commit all prior set_tensor writes (host->device on reg_ctx->stream) before compute
-    ctx->reg_ctx->stream->finish();
+    // All op networks share reg_ctx->stream (one in-order queue) - set_tensor
+    // writes, every execute, and get_tensor reads all land on it in order, so no
+    // per-op finish() is needed. (set_tensor/get_tensor use blocking copy_from/to,
+    // so they're already committed on the stream before/after executes.)
+    ctx->op_cache.stream = ctx->reg_ctx->stream;
     if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu] graph_compute n_nodes=%d\n", cgraph->n_nodes);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -179,6 +187,30 @@ static enum ggml_status ggml_backend_ovgpu_graph_compute(ggml_backend_t backend,
 
         if (node->op == GGML_OP_NONE) {
             continue; // leaf / no-op; data already lives in the buffer
+        }
+        switch (node->op) {
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                continue;  // pure metadata (ne/nb only); no kernel to launch
+            default:
+                break;
+        }
+
+        // Zero-element output. A multi-ubatch decode's non-final ubatch has
+        // n_outputs==0, so the last-layer ggml_get_rows(cur, inp_out_ids) gets an
+        // ids tensor with ne[0]==0 (models/llama.cpp last-layer output gather),
+        // and every op downstream of it (FFN mul_mat, logits mul_mat, ...) also
+        // produces a 0-element dst. cldnn's reshape / oneDNN FC reject zero-count
+        // buffers ("output layout count ... not equal to input layout count(=0)")
+        // and throw, which surfaces as llama_decode -3. A 0-element op writes
+        // nothing, so skip it entirely - the same semantics as the CPU backend,
+        // whose per-element threads simply do no work on an empty tensor. Only the
+        // real outputs of the ubatch (K/V into the cache via SET_ROWS, which is
+        // non-zero) are needed and still run.
+        if (ggml_nelements(node) == 0) {
+            continue;
         }
 
         if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   node %d op=%d\n", i, node->op);
@@ -189,15 +221,27 @@ static enum ggml_status ggml_backend_ovgpu_graph_compute(ggml_backend_t backend,
         }
         if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   built\n");
 
-        // bind inputs in the translator's declared order (build_mul_mat: {weight=src[0], activation=src[1]})
-        for (size_t k = 0; k < co->input_ids.size(); k++) {
-            const ggml_tensor * src = node->src[k];
-            GGML_ASSERT(src && src->buffer && "OVGPU: input not in backend buffer");
-            auto * buf_ctx = (ggml_backend_ovgpu_buffer_context *) src->buffer->context;
-            size_t off = (char *) src->data - (char *) buf_ctx->base;
-            if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   bind in %s off=%zu\n", co->input_ids[k].c_str(), off);
-            auto mem = ggml::ovgpu::wrap_tensor(engine, *buf_ctx->mem, src, off);
-            co->net->set_input_data(co->input_ids[k], mem);
+        // Bind inputs in the translator's declared order, SKIPPING absent (NULL)
+        // optional srcs. Translators list input_ids only for the srcs that exist
+        // (e.g. SOFT_MAX with sinks but no mask: src[0]=scores, src[1]=NULL(mask),
+        // src[2]=sinks -> input_ids={"in_0","in_2"}); binding positionally would
+        // hand the NULL mask to the sinks slot. So walk src[0..], skip NULL, and
+        // bind each present src to the next input_id in turn.
+        {
+            size_t ii = 0;
+            for (int k = 0; k < GGML_MAX_SRC && ii < co->input_ids.size(); k++) {
+                const ggml_tensor * src = node->src[k];
+                if (!src) {
+                    continue;  // optional src absent (e.g. SOFT_MAX mask / ROPE ff)
+                }
+                GGML_ASSERT(src->buffer && "OVGPU: input not in backend buffer");
+                auto * buf_ctx = (ggml_backend_ovgpu_buffer_context *) src->buffer->context;
+                size_t off = (char *) src->data - (char *) buf_ctx->base;
+                if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   bind in %s (src[%d]) off=%zu\n", co->input_ids[ii].c_str(), k, off);
+                auto mem = ggml::ovgpu::wrap_tensor(engine, *buf_ctx->mem, co->layout_for(src), off);
+                co->net->set_input_data(co->input_ids[ii], mem);
+                ii++;
+            }
         }
         if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   inputs bound\n");
 
@@ -206,15 +250,17 @@ static enum ggml_status ggml_backend_ovgpu_graph_compute(ggml_backend_t backend,
             ggml_tensor * dst = node;
             auto * buf_ctx = (ggml_backend_ovgpu_buffer_context *) dst->buffer->context;
             size_t off = (char *) dst->data - (char *) buf_ctx->base;
-            auto mem = ggml::ovgpu::wrap_tensor(engine, *buf_ctx->mem, dst, off);
+            auto          mem     = ggml::ovgpu::wrap_tensor(engine, *buf_ctx->mem, co->layout_for(dst), off);
             co->net->set_output_memory(co->output_id, mem);
         }
 
         co->net->execute();
-        co->net->get_stream().finish(); // commit output before get_tensor (cross-stream)
+        // NO per-op finish(): all networks share reg_ctx->stream (in-order), so op
+        // N's output is committed before op N+1's execute reads it. The caller's
+        // get_tensor (blocking copy_to on the same stream) is ordered after the last
+        // execute, so it sees committed data without an explicit finish here.
     }
 
-    ctx->reg_ctx->stream->finish();
     return GGML_STATUS_SUCCESS;
 }
 
@@ -316,7 +362,20 @@ static bool ggml_backend_ovgpu_device_supports_op(ggml_backend_dev_t dev, const 
 
     switch (op->op) {
         case GGML_OP_NONE:  // leaf tensor (weight / input) - supported if its type is
-            return ok_t(op->type);
+            // I32/I64 leaves are indices (e.g. GET_ROWS / SET_ROWS), not a compute
+            // dtype - allow them through as plain data, distinct from ok_t.
+            return ok_t(op->type) || op->type == GGML_TYPE_I32 || op->type == GGML_TYPE_I64;
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            // Pure metadata (no compute): data already lives in the buffer, only
+            // ne/nb change. test-backend-ops queries supports_op on every tensor
+            // in the graph (not just compute-op nodes), so these must be allowed
+            // through or an otherwise-supported op reading such a view/reshape
+            // (e.g. RMS_NORM's non-contiguous test case) would be rejected here
+            // first. graph_compute skips them the same way as GGML_OP_NONE.
+            return true;
         case GGML_OP_MUL_MAT: {
             const ggml_tensor * w = op->src[0];
             const ggml_tensor * a = op->src[1];
@@ -325,13 +384,373 @@ static bool ggml_backend_ovgpu_device_supports_op(ggml_backend_dev_t dev, const 
             // weight must be 2D: a group dim (ne[2]/ne[3] > 1) is the GQA-style
             // weight broadcast, which a single 2D-weight FC cannot express -> CPU.
             if (ggml_n_dims(w) != 2) return false;
-            // operands must be contiguous: the flat-batch mapping assumes tight
-            // strides, so permuted views (ggml_permute) and strided K views break it.
-            if (!ggml_is_contiguous(w) || !ggml_is_contiguous(a)) return false;
+            // operands must be contiguous, a "flat padded view" (k_v sub-box), OR a
+            // "strided view" (genuine permute/transpose - e.g. the decomposed
+            // attention's permuted KV-cache q/k/v). build_mul_mat compacts strided
+            // operands (permute+reorder+reshape) before FC.
+            auto ok_mm_operand = [](const ggml_tensor * t) {
+                return ggml_is_contiguous(t) || ggml::ovgpu::ggml_is_flat_padded_view(t) ||
+                       ggml::ovgpu::ggml_is_strided_view(t);
+            };
+            if (!ok_mm_operand(w) || !ok_mm_operand(a)) {
+                return false;
+            }
             if (w->ne[0] != a->ne[0]) return false; // K must match
             // mixed dtypes allowed: f32/f16/bf16 x f32/f16/bf16 -> f32 dst.
             return true;
         }
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+            {
+                // dst = src[0] (+|*) src[1], dst type == src[0]. Both contiguous runtime
+                // activations. ggml allows ggml_can_repeat (b TILES into a - a.ne[i] %
+                // b.ne[i]==0), but cldnn eltwise uses NUMPY broadcast (one operand's dim
+                // must be 1). So accept only the subset that reduces to NUMPY broadcast:
+                // for each dim, a->ne[i]==b->ne[i] (match) or b->ne[i]==1 (b broadcasts).
+                // The tiling case (b->ne[i]>1 but <a->ne[i]) is NOT supported -> CPU.
+                const ggml_tensor * a = op->src[0];
+                const ggml_tensor * b = op->src[1];
+                if (!a || !b) {
+                    return false;
+                }
+                if (!ok_t(a->type) || !ok_t(b->type)) {
+                    return false;
+                }
+                // Contiguous, or a "strided view" - a sub-box view and/or a permute/
+                // transpose (e.g. test_bin_bcast's perm1) - see ggml_is_strided_view.
+                if (!ggml_is_contiguous(a) && !ggml::ovgpu::ggml_is_strided_view(a)) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(b) && !ggml::ovgpu::ggml_is_strided_view(b)) {
+                    return false;
+                }
+                if (!ggml_can_repeat(b, a)) {
+                    return false;
+                }
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    if (a->ne[i] != b->ne[i] && b->ne[i] != 1) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        case GGML_OP_RMS_NORM:
+            {
+                // dst = src0 / sqrt(mean(src0^2, ne[0]) + eps). No src[1] (gamma is a
+                // separate ggml MUL). dst type == src0. Contiguous, or a "padded view"
+                // (strided sub-box, e.g. ggml_view_4d) - see ggml_is_padded_view.
+                const ggml_tensor * a = op->src[0];
+                if (!a) {
+                    return false;
+                }
+                if (!ok_t(a->type)) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(a) && !ggml::ovgpu::ggml_is_padded_view(a)) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_SOFT_MAX:
+            {
+                // dst = softmax(src0*scale + slope*mask) over ne[0], with optional
+                // ALiBi (max_bias>0 -> per-head slope) and sinks (src[2], per-head
+                // max-prior). Two paths: plain (no mask/sinks/ALiBi/scale) -> cldnn
+                // softmax; otherwise the OVGPU_SOFT_MAX_KERNEL custom_gpu port of
+                // ggml-cpu softmax (handles ggml's modular nr23 mask broadcast
+                // i02%ne12/i03%ne13, per-head ALiBi slope, and sinks). a contiguous;
+                // mask contiguous f16/f32 with ne[0]==a.ne[0] && ne[1]==a.ne[1] (cpu
+                // indexes mask by i01 directly); sinks f32 [a.ne[2]].
+                const ggml_tensor * a = op->src[0];
+                if (!a) {
+                    return false;
+                }
+                if (!ok_t(a->type)) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(a)) {
+                    return false;
+                }
+                const ggml_tensor * mask = op->src[1];
+                if (mask) {
+                    if (mask->type != GGML_TYPE_F32 && mask->type != GGML_TYPE_F16) {
+                        return false;
+                    }
+                    if (!ggml_is_contiguous(mask)) {
+                        return false;
+                    }
+                    if (mask->ne[0] != a->ne[0] || mask->ne[1] != a->ne[1]) {
+                        return false;  // mask dim0/dim1 must match a (modular broadcast
+                                      // is only over ne[2]/ne[3])
+                    }
+                }
+                const ggml_tensor * sinks = op->src[2];
+                if (sinks) {
+                    if (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks)) {
+                        return false;
+                    }
+                    if (sinks->ne[0] != a->ne[2]) {
+                        return false;  // one sink per head (a.ne[2])
+                    }
+                }
+                return true;
+            }
+        case GGML_OP_GET_ROWS:
+            {
+                // dst = table[indices] (row gather). dst always f32, indices always
+                // I32 (ggml_get_rows asserts). Scope: 2D table only - a grouped/
+                // batched table (ne[2]>1, the GQA-style case) is deferred to CPU,
+                // same as MUL_MAT's weight-broadcast deferral. bf16 excluded: the
+                // clDNN gather kernel selector has no bf16 kernel and aborts
+                // (ov::AssertFailure) instead of failing gracefully - verified via
+                // test-backend-ops crash investigation, see WORKLOG.
+                const ggml_tensor * table = op->src[0];
+                const ggml_tensor * ids   = op->src[1];
+                if (!table || !ids) {
+                    return false;
+                }
+                if (!ok_t(table->type)) {
+                    return false;
+                }
+                if (table->type == GGML_TYPE_BF16) {
+                    return false;
+                }
+                if (ids->type != GGML_TYPE_I32) {
+                    return false;
+                }
+                if (table->ne[2] != 1 || table->ne[3] != 1) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(table) || !ggml_is_contiguous(ids)) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_CPY:
+            {
+                // dst = copy of src[0] into src[1] (node is a view of src[1]=b).
+                // Types may differ (cast f32/f16/bf16/i32). Scope: same ne[] (a
+                // reshape across axis decompositions deferred), contiguous a and b
+                // (permuted src / strided-dst views deferred to CPU).
+                const ggml_tensor * a = op->src[0];
+                const ggml_tensor * b = op->src[1];
+                if (!a || !b) {
+                    return false;
+                }
+                auto cpy_t = [](ggml_type t) {
+                    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_I32;
+                };
+                if (!cpy_t(a->type) || !cpy_t(b->type)) {
+                    return false;
+                }
+                // Cast-DOWN to bf16 (f32/f16 -> bf16) diverges from ggml's
+                // round-to-nearest-even (cldnn's bf16 cast rounds differently,
+                // NMSE ~1e-5 > 1e-6) -> offload to CPU. Same-type bf16 copy and
+                // cast FROM bf16 (exact) are kept.
+                if (b->type == GGML_TYPE_BF16 && a->type != GGML_TYPE_BF16) {
+                    return false;
+                }
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    if (a->ne[i] != b->ne[i]) {
+                        return false;
+                    }
+                }
+                if (!ggml_is_contiguous(a) && !ggml::ovgpu::ggml_is_strided_view(a)) {
+                    return false;
+                }
+                // Strided/permuted bf16 src produces wrong results (cldnn's
+                // permute/reorder kernel path mis-handles bf16 + padding - f16/f32
+                // strided work, bf16 strided does not). Offload bf16 strided to CPU.
+                if (!ggml_is_contiguous(a) && a->type == GGML_TYPE_BF16) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(b)) {
+                    return false;  // strided dst (dst_alloc / permute_dst) deferred
+                }
+                return true;
+            }
+        case GGML_OP_CONT:
+            {
+                // dst = contiguous copy of src[0] (ggml_cont: fresh contiguous dst,
+                // same type as src). Reuses build_cpy (src[1]=NULL). src contiguous
+                // (flat copy) or strided/padded view (permute+reorder); strided bf16
+                // -> CPU (same cldnn bf16+padding quirk as CPY). dst is always
+                // contiguous. This is the most frequent op in the llama graph (ggml
+                // inserts it to ensure contiguity before matmuls) - supporting it
+                // removes a large number of CPU splits.
+                const ggml_tensor * a = op->src[0];
+                if (!a) return false;
+                auto cpy_t = [](ggml_type t) {
+                    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_I32;
+                };
+                if (!cpy_t(a->type)) return false;
+                if (!ggml_is_contiguous(a) && !ggml::ovgpu::ggml_is_strided_view(a)) return false;
+                if (!ggml_is_contiguous(a) && a->type == GGML_TYPE_BF16) return false;
+                return true;
+            }
+        case GGML_OP_SET_ROWS:
+            {
+                // node = view of src[2]=a (dst table); src[0]=b (updates),
+                // src[1]=c (indices). Custom OpenCL kernel (scatter_update can't
+                // express per-group batched indices). Cross-type f32<->f16 writes
+                // supported (f32 updates -> f16 KV cache): the kernel casts on
+                // write (SRCFLOAT -> DSTFLOAT, round-to-nearest-even, matching
+                // ggml). Quantized dst (Q4_0/Q8_0/...) needs block quantization
+                // the scalar kernel can't do -> CPU. bf16 excluded (cldnn bf16
+                // padding path mis-handles, same as CPY). i32/i64 indices.
+                // Batched (ne2/ne3 > 1) + broadcast (ne11|ne2, ne12|ne3) handled
+                // natively by the kernel.
+                const ggml_tensor * b = op->src[0];
+                const ggml_tensor * c = op->src[1];
+                const ggml_tensor * a = op->src[2];
+                if (!b || !c || !a) {
+                    return false;
+                }
+                if (b->type != GGML_TYPE_F32 && b->type != GGML_TYPE_F16) {
+                    return false;  // updates must be f32/f16
+                }
+                if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) {
+                    return false;  // dst table must be f32/f16 (quantized/bf16 -> CPU)
+                }
+                if (c->type != GGML_TYPE_I32 && c->type != GGML_TYPE_I64) {
+                    return false;
+                }
+                // b/c may be contiguous OR a "padded view" (test_set_rows v=true:
+                // a sub-box view of [ne0,r,...] sliced to r/2 rows). build_set_rows
+                // pre-compacts padded views (bind per-dim padded -> reorder ->
+                // reshape to flat) before the flat-indexing kernel. A genuinely
+                // permuted operand (not a padded sub-box) -> CPU.
+                auto ok_layout = [](const ggml_tensor * t) {
+                    return ggml_is_contiguous(t) || ggml::ovgpu::ggml_is_padded_view(t);
+                };
+                if (!ok_layout(b) || !ok_layout(c) || !ggml_is_contiguous(a)) {
+                    return false;  // a (dst table) is the in-place output - must be
+                                   // contiguous (the kernel writes flat into it)
+                }
+                return true;
+            }
+        case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
+            {
+                // build_rope (custom_gpu kernel): all modes (NORMAL/NEOX/MROPE/
+                // IMROPE/VISION), YaRN (ext_factor/attn_factor), forward + BACK,
+                // contiguous src0. Strided/padded src0 (v=1/v=2 views) deferred -
+                // the kernel indexes flat raw memory (nb-stride indexing is a
+                // follow-up). freq_factors (src[2]) optional, F32, contiguous.
+                const ggml_tensor * a   = op->src[0];
+                const ggml_tensor * pos = op->src[1];
+                const ggml_tensor * ff  = op->src[2];
+                if (!a || !pos) {
+                    return false;
+                }
+                if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (pos->type != GGML_TYPE_I32) {
+                    return false;
+                }
+                const int32_t * op_params = (const int32_t *) op->op_params;
+                const int mode = op_params[2];
+                if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX &&
+                    mode != GGML_ROPE_TYPE_MROPE  && mode != GGML_ROPE_TYPE_IMROPE &&
+                    mode != GGML_ROPE_TYPE_VISION) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(a)) {
+                    return false;  // strided/padded src0 view -> CPU (flat-indexing kernel)
+                }
+                if (ff) {
+                    if (ff->type != GGML_TYPE_F32 || !ggml_is_contiguous(ff)) {
+                        return false;
+                    }
+                }
+                // The kernel computes cos/sin inline; OpenCL cos/sin can differ
+                // from host cosf/sinf by ~1 ULP. Float constants (theta_scale,
+                // freq_scale, mscale, ...) are serialized with %.9g so the GPU
+                // theta progression matches the host EXACTLY (a 6-digit
+                // std::to_string drifted ~4e-7/step -> ~2.6e-5 over n_dims/2
+                // pairs, intermittently flipping f16 rounding). With exact theta
+                // the residual 1-ULP cos/sin difference stays well inside the
+                // comparison threshold for f16, so no precision gate is needed.
+                return true;
+            }
+        case GGML_OP_UNARY:
+            {
+                // SILU subtype only (out = silu(x) = x/(1+exp(-x))). Other unary
+                // ops (GELU/RELU/...) -> CPU. Custom kernel; f32/f16, contiguous
+                // or padded view (v=1). dst = new contiguous tensor.
+                if (ggml_get_op_params_i32(op, 0) != GGML_UNARY_OP_SILU) return false;
+                const ggml_tensor * a = op->src[0];
+                if (!a) return false;
+                if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) return false;
+                if (!ggml_is_contiguous(a) && !ggml::ovgpu::ggml_is_padded_view(a)) return false;
+                return true;
+            }
+        case GGML_OP_GLU:
+            {
+                // SwiGLu only (out = silu(a)*b). 2-input (glu_split, what Llama
+                // uses) or 1-input (split halves + swapped). Other GLU ops
+                // (GEGLU/REGLU/...) -> CPU. f32/f16, contiguous or padded view.
+                const ggml_tensor * a = op->src[0];
+                const ggml_tensor * b = op->src[1];
+                if (!a) return false;
+                if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) return false;
+                if (ggml_get_op_params_i32(op, 0) != GGML_GLU_OP_SWIGLU) return false;
+                if (!ggml_is_contiguous(a) && !ggml::ovgpu::ggml_is_padded_view(a)) return false;
+                if (b) {
+                    if (b->type != a->type) return false;
+                    if (!ggml_is_contiguous(b) && !ggml::ovgpu::ggml_is_padded_view(b)) return false;
+                }
+                return true;
+            }
+        case GGML_OP_CONCAT:
+            {
+                // dst = [src0, src1] along dim (op_params[0]). Custom stride-aware
+                // kernel (one work-item/element, byte copy). blck_size==1 types
+                // (f32/f16/i32/i8...); quantized block types -> CPU. Contiguous or
+                // padded view inputs.
+                const ggml_tensor * s0 = op->src[0];
+                const ggml_tensor * s1 = op->src[1];
+                if (!s0 || !s1) return false;
+                if (s0->type != s1->type) return false;
+                if (ggml_blck_size(s0->type) != 1) return false;
+                if (s0->type == GGML_TYPE_BF16) return false;  // bf16 concat gives wrong
+                    // results (same cldnn bf16+raw-bind quirk as CPY strided); KV cache is f16
+                if (!ggml_is_contiguous(s0) && !ggml::ovgpu::ggml_is_padded_view(s0)) return false;
+                if (!ggml_is_contiguous(s1) && !ggml::ovgpu::ggml_is_padded_view(s1)) return false;
+                return true;
+            }
+        case GGML_OP_FLASH_ATTN_EXT:
+            {
+                // SDPA primitive mapping (build_flash_attn_ext). Gates to CPU:
+                // ALiBi (max_bias>0), logit_softcap>0, sinks (src[4]).
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * k = op->src[1];
+                const ggml_tensor * v = op->src[2];
+                const ggml_tensor * m = op->src[3];
+                if (!q || !k || !v) return false;
+                if (q->type != GGML_TYPE_F32 && q->type != GGML_TYPE_F16) return false;
+                if (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32) return false;
+                if (v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_F32) return false;
+                float max_bias, logit_softcap;
+                memcpy(&max_bias,      op->op_params + 1, sizeof(float));
+                memcpy(&logit_softcap, op->op_params + 2, sizeof(float));
+                if (max_bias != 0.0f || logit_softcap != 0.0f) return false;
+                if (op->src[4]) return false;
+                if (m) {
+                    if (m->type != GGML_TYPE_F16 && m->type != GGML_TYPE_F32) return false;
+                    if (!ggml_is_contiguous(m)) return false;
+                }
+                // Mismatched K/V head sizes (hsk != hsv, MLA-style) with large heads ->
+                // CPU. The cldnn SDPA kernel (sdpa_opt multi-token path; micro is disabled
+                // for K_head!=V_head) segfaults on large-prefill builds for the MLA configs
+                // DeepSeek 576/512 and Mistral4 320/256 (deterministic, not catchable - a
+                // signal, not an exception). Smaller mismatched heads (192/128) pass the full
+                // matrix, so only gate when max(hsk,hsv) > 256. Standard hsk==hsv attention
+                // (Llama/Qwen/etc.) is unaffected.
+                if (q->ne[0] != v->ne[0] && (q->ne[0] > 256 || v->ne[0] > 256)) return false;
+                return true;
+            }
         default:
             return false;
     }
@@ -394,7 +813,14 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_ovgpu_reg(void) {
 
         auto * ocl_engine = dynamic_cast<cldnn::ocl::ocl_engine *>(ctx->engine.get());
         GGML_ASSERT(ocl_engine != nullptr);
-        ctx->stream = ocl_engine->create_stream(cldnn::ExecutionConfig{});
+        // IN-ORDER stream: shared by ALL op networks (see make_network) so kernel
+        // execution is ordered by the queue itself - op N's output is committed
+        // before op N+1's kernels run, with NO per-op finish(). (cldnn's default
+        // queue is out-of-order, which would need explicit event/finish sync
+        // between networks.) Intra-network primitives are likewise queue-ordered.
+        cldnn::ExecutionConfig stream_cfg;
+        stream_cfg.set_property(ov::intel_gpu::queue_type(cldnn::QueueTypes::in_order));
+        ctx->stream = ocl_engine->create_stream(stream_cfg);
 
         if (getenv("GGML_OVGPU_SMOKE_TEST")) {
             ggml_ovgpu_smoke_test(*ctx->engine);

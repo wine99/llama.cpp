@@ -864,7 +864,7 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     return -1;
 }
 
-#if 0
+#if 1
 #define GGML_SCHED_MAX_SPLITS_DEBUG 4096
 static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML_SCHED_MAX_SPLIT_INPUTS][128]; // debug only
 #define SET_CAUSE(node, ...) sprintf(causes[hash_id(node)], __VA_ARGS__)
@@ -1538,6 +1538,98 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Dump one tensor as a single line: op, name, type, ne[], nb[], buffer type, and view_src+view_offs (if a view).
+static void ggml_backend_dump_tensor_line(FILE * fp, const char * prefix, const struct ggml_tensor * t) {
+    const char * nm = t->name[0] ? t->name : "";
+    fprintf(fp, "%s%-16s name='%s' type=%-7s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]",
+        prefix, ggml_op_desc(t), nm, ggml_type_name(t->type),
+        (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+        t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+    if (t->buffer) {
+        fprintf(fp, " buft='%s'", ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer)));
+    } else {
+        fprintf(fp, " buft=(none)");
+    }
+    if (t->view_src) {
+        const char * vnm = t->view_src->name[0] ? t->view_src->name : "";
+        fprintf(fp, " view_src='%s'@%zu", vnm, t->view_offs);
+    }
+    fprintf(fp, "\n");
+}
+
+// GGML_CGRAPH_DUMP=N: dump up to N sched calls' cgraphs to text files for debugging.
+//   - the full graph (post-alloc, pre-split) at the start of ggml_backend_sched_graph_compute_async
+//   - each backend split's graph in ggml_backend_sched_compute_splits
+// One file per dump, written into the process CWD, named ggml-cgraph-<seq>-{full|<backend>-split<i>}.txt.
+// backend_name == NULL marks the full-graph call (one per sched call and consumes one unit of the N budget);
+// split calls are emitted only while the current sched call is within budget.
+static void ggml_backend_dump_cgraph(struct ggml_cgraph * graph, const char * backend_name, int split_id) {
+    static int  max_calls  = -2;  // -2 = not yet initialized from env
+    static int  calls_left = 0;
+    static bool cur_active = false;
+    static int  seq        = 0;
+
+    if (max_calls == -2) {
+        const char * env = getenv("GGML_CGRAPH_DUMP");
+        if (env && env[0] && atoi(env) > 0) {
+            max_calls  = atoi(env);
+            calls_left = max_calls;
+        } else {
+            max_calls = 0;
+        }
+    }
+    if (max_calls == 0) return;
+
+    if (backend_name == NULL) {            // full graph = beginning of a sched call
+        cur_active = (calls_left > 0);
+        if (cur_active) calls_left--;
+        if (!cur_active) return;
+    } else {                               // a backend split graph
+        if (!cur_active) return;
+    }
+
+    char fname[192];
+    if (backend_name) {
+        snprintf(fname, sizeof(fname), "ggml-cgraph-%04d-%s-split%d.txt", seq, backend_name, split_id);
+    } else {
+        snprintf(fname, sizeof(fname), "ggml-cgraph-%04d-full.txt", seq);
+    }
+    seq++;
+
+    FILE * fp = fopen(fname, "w");
+    if (!fp) return;
+
+    fprintf(fp, "=== cgraph dump ===\n");
+    fprintf(fp, "tag=%s split_id=%d n_nodes=%d n_leafs=%d size=%d\n",
+        backend_name ? backend_name : "full", split_id, graph->n_nodes, graph->n_leafs, graph->size);
+    fprintf(fp, "legend: <op-or-unary-subtype> name='...' type=... ne=[..] nb=[..] buft='...' view_src='...'@offs\n\n");
+
+    fprintf(fp, "--- NODES ---\n");
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        fprintf(fp, "\n[%d] ", i);
+        ggml_backend_dump_tensor_line(fp, "NODE  ", node);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const struct ggml_tensor * src = node->src[j];
+            if (!src) continue;
+            char prefix[24];
+            snprintf(prefix, sizeof(prefix), "  src[%d] ", j);
+            ggml_backend_dump_tensor_line(fp, prefix, src);
+        }
+    }
+
+    if (graph->n_leafs > 0) {
+        fprintf(fp, "\n--- LEAFS ---\n");
+        for (int i = 0; i < graph->n_leafs; i++) {
+            fprintf(fp, "[%d] ", i);
+            ggml_backend_dump_tensor_line(fp, "LEAF  ", graph->leafs[i]);
+        }
+    }
+
+    fclose(fp);
+    fprintf(stderr, "ggml_backend_dump_cgraph: wrote %s (n_nodes=%d)\n", fname, graph->n_nodes);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1550,6 +1642,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        // dump this backend's split cgraph for debugging [GGML_CGRAPH_DUMP]
+        ggml_backend_dump_cgraph(&split->graph, ggml_backend_name(split_backend), split_id);
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1897,6 +1992,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
+
+    // dump the full cgraph (post-alloc, pre-split) for debugging [GGML_CGRAPH_DUMP]
+    ggml_backend_dump_cgraph(graph, NULL, 0);
 
     return ggml_backend_sched_compute_splits(sched);
 }

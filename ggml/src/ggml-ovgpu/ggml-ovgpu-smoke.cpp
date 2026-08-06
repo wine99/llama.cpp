@@ -10,7 +10,9 @@
 #include <intel_gpu/primitives/data.hpp>
 #include <intel_gpu/primitives/fully_connected.hpp>
 #include <intel_gpu/primitives/input_layout.hpp>
+#include <intel_gpu/primitives/reorder.hpp>
 #include <intel_gpu/runtime/engine.hpp>
+#include <intel_gpu/runtime/internal_properties.hpp>
 #include <intel_gpu/runtime/memory.hpp>
 #include <intel_gpu/runtime/stream.hpp>
 
@@ -23,11 +25,27 @@ void ggml_ovgpu_smoke_test(cldnn::engine & engine) {
 
     const int B = 4, K = 8, N = 16;
 
+    // Replicate OV's working oneDNN FC test (bf16_onednn_ops_gpu_test.cpp:227):
+    // matrix on [b,f], bfyx{B,K,1,1} input + {N,K,1,1} weight, default ctor
+    // (input_size=2, weights_transposed=true).
     auto input   = engine.allocate_memory(layout{ov::element::f32, format::bfyx, tensor(B, K, 1, 1)});
     auto weights = engine.allocate_memory(layout{ov::element::f32, format::bfyx, tensor(N, K, 1, 1)});
     auto bias    = engine.allocate_memory(layout{ov::element::f32, format::bfyx, tensor(1, N, 1, 1)});
 
+    topology topo(
+        input_layout("input", input->get_layout()),
+        data("weights", weights),
+        data("bias", bias),
+        fully_connected("fc", input_info("input"), "weights", "bias"),
+        reorder("out", input_info("fc"), format::bfyx, data_types::f32));
+
     ExecutionConfig config;
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::use_onednn(true));
+    // NOTE: do NOT set allow_new_shape_infer(true) - the new-shape-infer path
+    // (calc_output_layouts, plural) feeds raw rank-4 shapes to MatMul shape_infer
+    // without the reshape_to_2d collapse, failing batch broadcast. The legacy
+    // calc_output_layout (singular) does reshape_to_2d for supports_immad devices.
     auto stream = engine.create_stream(config);
 
     std::vector<float> h_input(B * K), h_weights(N * K), h_bias(N);
@@ -52,17 +70,11 @@ void ggml_ovgpu_smoke_test(cldnn::engine & engine) {
         memcpy(l_bias.data(), h_bias.data(), h_bias.size() * sizeof(float));
     }
 
-    topology topo(
-        input_layout("input", input->get_layout()),
-        data("weights", weights),
-        data("bias", bias),
-        fully_connected("fc", input_info("input"), "weights", "bias"));
-
     network net(engine, topo, config);
     net.set_input_data("input", input);
 
     auto outputs = net.execute();
-    auto output = outputs.at("fc").get_memory();
+    auto output = outputs.at("out").get_memory();
 
     std::vector<float> h_out(B * N);
     {

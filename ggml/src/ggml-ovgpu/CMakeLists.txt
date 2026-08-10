@@ -65,6 +65,7 @@ target_include_directories(ggml-ovgpu SYSTEM PRIVATE
     ${OVGPU_INTEL_GPU}/include
     ${OVGPU_INTEL_GPU}/src
     ${OVGPU_INTEL_GPU}/src/runtime
+    ${OVGPU_INTEL_GPU}/src/graph
     ${OVGPU_INTEL_GPU}/src/graph/include
     ${GGML_OVGPU_OV_SOURCE_DIR}/build/Release/src/plugins/intel_gpu/thirdparty/onednn_gpu_install/include
     ${GGML_OVGPU_OV_SOURCE_DIR}/src/inference/dev_api

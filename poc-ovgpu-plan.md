@@ -2,7 +2,9 @@
 
 Status: M1 in progress on Lunar Lake - MUL_MAT, ADD/MUL, RMS_NORM, SOFT_MAX (basic),
 GET_ROWS all landed and passing (see WORKLOG for per-op pass counts). M0 + build
-wired. Detailed log: WORKLOG.md, short status + next steps: STATUS.md. Worktree:
+wired. **Op fusion (Tier B-lite) landed 2026-08-07**: `rms->MUL` + `FC->ADD` chains fuse
+via `program::fuse_nodes`, decode +10-23% (see WORKLOG pm15). Detailed log: WORKLOG.md,
+short status + next steps: STATUS.md. Worktree:
 llama.cpp-ovgpu, branch poc-ov-gpu-backend (base: dev_backend_openvino).
 
 MUL_MAT: 116/116 supported cases pass (f32/f16/bf16 weights x f32/f16/bf16 act, weight
@@ -288,3 +290,16 @@ Keep the backend cache (complementary, not redundant); its only cost is memory (
 networks) -> add an LRU cap (byte/entry budget) to bound growth (later task). A future
 bigger step: build one cldnn network per ggml *subgraph* (let cldnn fuse across ops),
 which would shift caching to the graph level.
+
+**UPDATE 2026-08-07 (pm15) - Tier B-lite (fusible-chain subgraphs) DONE.** The
+"one cldnn network per subgraph" step is implemented for the fusible-chain subset:
+`build_chain` builds ONE topology per linear chain `[head, child1, ...]` (head MUL_MAT/RMS_NORM,
+children ADD/MUL/UNARY-SILU) and `program::fuse_nodes` merges the children into the head.
+Verified: `rms->MUL(gamma)` and `FC->ADD(residual)` fuse (oneDNN FC accepts eltwise/activation
+post-ops on Lunar Lake); decode +10-23%, output bit-identical, 1869/1869 regression. NOT yet
+full Tier B (arbitrary split capture) - only single-linear-chain fusion, gated to
+single-consumer intermediates + contiguous FC operands. Chain cache (`chain_cache`) sits
+alongside `op_cache` (same shape-keyed amortization). Diagnostics `GGML_OVGPU_FUSE_TRACE`/
+`FUSE_DISABLE`. Next: decompose `ggml_swiglu_split` so `FC->SILU` chains form (FFN GLU
+bottleneck); investigate the strided-FC + post-op peer-format alignment. See WORKLOG pm15.
+

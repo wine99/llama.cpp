@@ -3,9 +3,23 @@
 > Short snapshot of current state + immediate next steps. Detailed how/why: WORKLOG.md.
 > Stable design: poc-ovgpu-plan.md. Updated as work progresses.
 
-Last updated: 2026-08-06
+Last updated: 2026-08-07
 Worktree: llama.cpp-ovgpu  |  Branch: poc-ov-gpu-backend (base: dev_backend_openvino)
 Dev box: Lunar Lake (Core Ultra 5 236V, Arc Graphics / Xe2, 56 CUs, supports_immad=1)
+
+**OP FUSION landed (Tier B-lite).** ovgpu was one single-primitive cldnn network per ggml
+op, so cldnn's program-level fuser had nothing to merge. Now `build_chain` builds ONE cldnn
+topology per fusible linear chain `[head, child1, ...]` and `program::fuse_nodes` merges the
+children into the head at build time. Verified fusible on Lunar Lake (oneDNN FC DOES accept
+eltwise/activation post-ops; rms fuses eltwise ungated): **`rms->MUL` (gamma)** and
+**`FC->ADD` (residual)** - both form + fuse in real models. Result: **decode (tg) +10% mean /
++23% best** (24 vs 21.75 t/s, d=0); pp512 unchanged (compute-bound). Output **bit-identical**
+fusion vs `GGML_OVGPU_FUSE_DISABLE=1`. `test-backend-ops` still 1869/1869. Diagnostics:
+`GGML_OVGPU_FUSE_TRACE=1` (confirms fusion per chain), `GGML_OVGPU_FUSE_DISABLE=1` (per-op A/B).
+FC chains gated to contiguous operands (strided-FC + post-op has a peer-format alignment bug
+to investigate; falls back to per-op, correct). `FC->SILU` implemented (oneDNN eltwise_swish
+post-op) but not triggered - llama's FFN uses `ggml_swiglu_split`, not decomposed silu+mul.
+See WORKLOG pm15 + memory `ovgpu-op-fusion-multi-op-cldnn`.
 
 **FLASH_ATTN_EXT works** - `test-backend-ops -o FLASH_ATTN_EXT` passes (714/714
 supported cases, 0 fail, 0 crashes, clean exit). Root cause of the prior garbage +
@@ -190,16 +204,23 @@ splits.
 
 ## Immediate next steps
 
-1. **FLASH_ATTN_EXT FIXED** (was the active blocker - garbage llama-simple output, test
+1. **OP FUSION landed (Tier B-lite)** - `rms->MUL` + `FC->ADD` chains fuse via
+   `program::fuse_nodes`; decode +10-23%. See top of file + WORKLOG pm15. Next decode
+   lever: **decompose `ggml_swiglu_split`** (the FFN GLU) into `SILU`+`MUL` at translation
+   so `FC->SILU` (already implemented) + `FC->SILU->MUL` chains form - that hits the GLU
+   decode bottleneck directly (the FFN gate/up matmuls + the swiglu custom kernel are a
+   known split). Also: investigate the strided-FC + post-op peer-format alignment so FC
+   chains can drop the contiguous-operand gate.
+2. **FLASH_ATTN_EXT FIXED** (was the active blocker - garbage llama-simple output, test
    failures). Root cause: cldnn SDPA kernels ignore `output_transpose_order` on write
    (see top of file). Fix = identity output order + explicit permute/reorder; strided
    input binding; no impl forcing. Residual: hsk!=hsv (MLA, large heads) gated to CPU
    (sdpa_opt segfaults). `test-backend-ops -o FLASH_ATTN_EXT` = 714/714 pass; full
    suite = 1869/1869. `llama-simple` (Llama-3.2-1B-Instruct-F16) verified: coherent
    output, 25 t/s decode, 30 graphs reused.
-2. All other M1 ops (MUL_MAT/ADD/MUL/RMS_NORM/SOFT_MAX/GET_ROWS/CPY/SET_ROWS/ROPE/
+3. All other M1 ops (MUL_MAT/ADD/MUL/RMS_NORM/SOFT_MAX/GET_ROWS/CPY/SET_ROWS/ROPE/
    CONCAT/GLU/UNARY) are done and passing 100%; not blocking.
-3. **Other llama tools VERIFIED** (was the next step):
+4. **Other llama tools VERIFIED** (was the next step):
    - **llama-bench** at depths: `pp512/tg128` at d=0 (3875 / 30.8 t/s), d=1024
      (1768 / 27.2), d=4096 (762 / 16.8) - all pass.
    - **llama-perplexity** (wikitext-2, `-b 512 -c 2048` -> 4 ubatches/chunk, exercises

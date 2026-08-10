@@ -179,10 +179,117 @@ static enum ggml_status ggml_backend_ovgpu_graph_compute(ggml_backend_t backend,
     // per-op finish() is needed. (set_tensor/get_tensor use blocking copy_from/to,
     // so they're already committed on the stream before/after executes.)
     ctx->op_cache.stream = ctx->reg_ctx->stream;
-    if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu] graph_compute n_nodes=%d\n", cgraph->n_nodes);
+    const bool debug       = getenv("GGML_OVGPU_DEBUG") != nullptr;
+    const bool fuse_disable = getenv("GGML_OVGPU_FUSE_DISABLE") != nullptr;
+    if (debug) fprintf(stderr, "[ovgpu] graph_compute n_nodes=%d\n", cgraph->n_nodes);
+
+    // Bind a ggml tensor's storage (zero-copy view over the backend USM buffer at the
+    // tensor's byte offset) into a cldnn network input/output slot. Shared by the
+    // per-op and chain paths.
+    auto bind_input = [&engine](cldnn::network & net, const std::string & id, const ggml_tensor * t,
+                                const cldnn::layout & lay) {
+        GGML_ASSERT(t->buffer && "OVGPU: input not in backend buffer");
+        auto * buf_ctx = (ggml_backend_ovgpu_buffer_context *) t->buffer->context;
+        size_t off = (char *) t->data - (char *) buf_ctx->base;
+        net.set_input_data(id, ggml::ovgpu::wrap_tensor(engine, *buf_ctx->mem, lay, off));
+    };
+    auto bind_output = [&engine](cldnn::network & net, const std::string & id, const ggml_tensor * t,
+                                 const cldnn::layout & lay) {
+        auto * buf_ctx = (ggml_backend_ovgpu_buffer_context *) t->buffer->context;
+        size_t off = (char *) t->data - (char *) buf_ctx->base;
+        net.set_output_memory(id, ggml::ovgpu::wrap_tensor(engine, *buf_ctx->mem, lay, off));
+    };
+
+    // --- Fusion chain detection (Tier B-lite). ---
+    // Find maximal linear chains [head, child1, ..., childN] where head is MUL_MAT
+    // (FC) or RMS_NORM (rms) and each non-final node's output has exactly ONE
+    // consumer (the next node) - so the intermediate is absorbable (cldnn fuses it
+    // away, the ggml dst is never materialized). Children are ADD/MUL (eltwise) in
+    // phase 1. build_chain is the authority on shape/dtype eligibility; if it rejects,
+    // chain_fail_cache prevents retry and we fall back to per-op at execute time.
+    struct chain_info {
+        std::vector<int> node_idx;  // [head, child1, ...] indices into cgraph->nodes
+    };
+    std::vector<chain_info> chain_at(cgraph->n_nodes);  // [i] populated iff i is a head
+    std::vector<bool>       is_chain_head(cgraph->n_nodes, false);
+    std::vector<bool>       absorbed(cgraph->n_nodes, false);
+
+    if (!fuse_disable) {
+        // node_index[t] = cgraph index of compute node t (leafs/weights are absent).
+        // consumers[t]  = node indices that list t in their src[].
+        std::unordered_map<const ggml_tensor *, int>              node_index;
+        std::unordered_map<const ggml_tensor *, std::vector<int>> consumers;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            node_index[cgraph->nodes[i]] = i;
+            for (int k = 0; k < GGML_MAX_SRC; k++) {
+                const ggml_tensor * s = cgraph->nodes[i]->src[k];
+                if (s) {
+                    consumers[s].push_back(i);
+                }
+            }
+        }
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_RMS_NORM) {
+                continue;
+            }
+            // skip metadata / zero-element heads (mirror the main-loop skips)
+            if (node->op == GGML_OP_NONE || ggml_nelements(node) == 0) {
+                continue;
+            }
+            std::vector<int>    chain = { i };
+            const ggml_tensor * cur = node;
+            while (true) {
+                auto it = consumers.find(cur);
+                if (it == consumers.end() || it->second.size() != 1) {
+                    break;  // 0 or >1 consumers -> cur is materialized (chain ends)
+                }
+                int                 next_idx = it->second[0];
+                const ggml_tensor * next = cgraph->nodes[next_idx];
+                if (absorbed[next_idx]) {
+                    break;  // already claimed by another chain (DAG -> shouldn't happen)
+                }
+                const bool next_eltwise = (next->op == GGML_OP_ADD || next->op == GGML_OP_MUL);
+                const bool next_silu =
+                    (next->op == GGML_OP_UNARY && ggml_get_op_params_i32(next, 0) == GGML_UNARY_OP_SILU);
+                if (!next_eltwise && !next_silu) {
+                    break;  // only eltwise (ADD/MUL) and SILU children fuse
+                }
+                // AVAILABILITY: the child's external operand (the non-chain src) must be
+                // already materialized when the chain runs at the head's position i. A
+                // leaf (weight/input) always is; a compute node is only if its cgraph
+                // index < i (so graph_compute executed it before reaching the head).
+                // This rejects diamond patterns like ((mm1+mm2)+mm3) where a child's
+                // external operand is a sibling matmul computed AFTER the head.
+                const ggml_tensor * ext = nullptr;
+                for (int k = 0; k < GGML_MAX_SRC; k++) {
+                    if (next->src[k] && next->src[k] != cur) {
+                        ext = next->src[k];
+                        break;
+                    }
+                }
+                if (ext) {
+                    auto eit = node_index.find(ext);
+                    if (eit != node_index.end() && eit->second >= i) {
+                        break;  // ext is a compute node not yet materialized at i
+                    }
+                    // else: leaf (always available) or compute node before i (available)
+                }
+                chain.push_back(next_idx);
+                cur = next;
+            }
+            if (chain.size() >= 2) {
+                chain_at[i] = { chain };
+                is_chain_head[i] = true;
+                for (size_t c = 1; c < chain.size(); c++) {
+                    absorbed[chain[c]] = true;
+                }
+            }
+        }
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   loop i=%d\n", i);
+        if (debug) fprintf(stderr, "[ovgpu]   loop i=%d\n", i);
         ggml_tensor * node = cgraph->nodes[i];
 
         if (node->op == GGML_OP_NONE) {
@@ -213,13 +320,57 @@ static enum ggml_status ggml_backend_ovgpu_graph_compute(ggml_backend_t backend,
             continue;
         }
 
-        if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   node %d op=%d\n", i, node->op);
+        // Absorbed into a fusion chain -> computed by the chain head's execute.
+        if (absorbed[i]) {
+            if (debug) fprintf(stderr, "[ovgpu]   node %d op=%d (absorbed)\n", i, node->op);
+            continue;
+        }
+
+        if (debug) fprintf(stderr, "[ovgpu]   node %d op=%d\n", i, node->op);
+
+        // --- Fusion chain path. ---
+        bool ran_chain = false;
+        if (is_chain_head[i]) {
+            std::vector<const ggml_tensor *> cnodes;
+            cnodes.reserve(chain_at[i].node_idx.size());
+            for (int idx : chain_at[i].node_idx) {
+                cnodes.push_back(cgraph->nodes[idx]);
+            }
+            auto co = ctx->op_cache.get_or_build_chain(cnodes);
+            if (co) {
+                // Bind the chain's external inputs (head operands + each child's
+                // non-chain operand, e.g. the residual / gamma), in the builder's
+                // declared order. input_src_map[k] = (chain-node-idx, src-idx).
+                for (size_t k = 0; k < co->input_ids.size(); k++) {
+                    int               ni = co->input_src_map[k].first;
+                    int               si = co->input_src_map[k].second;
+                    const ggml_tensor * src = cnodes[ni]->src[si];
+                    bind_input(*co->net, co->input_ids[k], src, co->input_layouts[k]);
+                }
+                // Bind the chain's single output (the final node's dst).
+                const ggml_tensor * final_node = cnodes.back();
+                bind_output(*co->net, co->output_id, final_node, co->layout_for(final_node));
+                co->net->execute();
+                ran_chain = true;
+            } else {
+                // build_chain rejected this chain (or it threw) -> fall back to per-op
+                // for the head AND un-absorb the members so the loop runs them per-op.
+                for (size_t c = 1; c < chain_at[i].node_idx.size(); c++) {
+                    absorbed[chain_at[i].node_idx[c]] = false;
+                }
+            }
+        }
+        if (ran_chain) {
+            continue;
+        }
+
+        // --- Per-op (Tier A) path. ---
         auto co = ctx->op_cache.get_or_build(node);
         if (!co) {
             GGML_LOG_ERROR("OVGPU: no translator for op %d (%s)\n", node->op, ggml_op_name(node->op));
             return GGML_STATUS_FAILED;
         }
-        if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   built\n");
+        if (debug) fprintf(stderr, "[ovgpu]   built\n");
 
         // Bind inputs in the translator's declared order, SKIPPING absent (NULL)
         // optional srcs. Translators list input_ids only for the srcs that exist
@@ -234,25 +385,15 @@ static enum ggml_status ggml_backend_ovgpu_graph_compute(ggml_backend_t backend,
                 if (!src) {
                     continue;  // optional src absent (e.g. SOFT_MAX mask / ROPE ff)
                 }
-                GGML_ASSERT(src->buffer && "OVGPU: input not in backend buffer");
-                auto * buf_ctx = (ggml_backend_ovgpu_buffer_context *) src->buffer->context;
-                size_t off = (char *) src->data - (char *) buf_ctx->base;
-                if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   bind in %s (src[%d]) off=%zu\n", co->input_ids[ii].c_str(), k, off);
-                auto mem = ggml::ovgpu::wrap_tensor(engine, *buf_ctx->mem, co->layout_for(src), off);
-                co->net->set_input_data(co->input_ids[ii], mem);
+                if (debug) fprintf(stderr, "[ovgpu]   bind in %s (src[%d])\n", co->input_ids[ii].c_str(), k);
+                bind_input(*co->net, co->input_ids[ii], src, co->layout_for(src));
                 ii++;
             }
         }
-        if (getenv("GGML_OVGPU_DEBUG")) fprintf(stderr, "[ovgpu]   inputs bound\n");
+        if (debug) fprintf(stderr, "[ovgpu]   inputs bound\n");
 
         // bind output in-place into the node's tensor
-        {
-            ggml_tensor * dst = node;
-            auto * buf_ctx = (ggml_backend_ovgpu_buffer_context *) dst->buffer->context;
-            size_t off = (char *) dst->data - (char *) buf_ctx->base;
-            auto          mem     = ggml::ovgpu::wrap_tensor(engine, *buf_ctx->mem, co->layout_for(dst), off);
-            co->net->set_output_memory(co->output_id, mem);
-        }
+        bind_output(*co->net, co->output_id, node, co->layout_for(node));
 
         co->net->execute();
         // NO per-op finish(): all networks share reg_ctx->stream (in-order), so op

@@ -605,3 +605,92 @@ failing node -> `get_or_build` returned null/threw, not a cache-hit-with-wrong-n
 The no-cache test (still failed) confirmed it. The actual differentiator between the two
 graphs was `n_outputs` (0 vs >=1) -> `out_ids` ne[0] (0 vs >=1) -> a NEW key that genuinely
 fails to build, not a collision.
+
+## pm15 - op fusion via multi-op cldnn topologies (Tier B-lite)
+
+**Goal:** ovgpu was Tier A - one single-primitive cldnn network per ggml op - so cldnn's
+program-level fuser (`prepare_primitive_fusing.cpp`, gated on `optimize_data(true)`, which
+`make_config` already sets) had nothing to merge: each topology had exactly one compute
+primitive. The per-op eager overhead (one bind+enqueue per node, plus materializing every
+intermediate) capped decode at ~parity with CPU. This milestone builds ONE cldnn topology
+per fusible *chain* of ops and lets `program::fuse_nodes` merge the children into the head
+at build time.
+
+**Fusibility verified** (read `prepare_primitive_fusing.cpp` + the oneDNN FC impl
+`fully_connected_onednn.{hpp,cpp}` + `program_node.cpp`'s `create_onednn_primitive_attributes`,
+via a research subagent). Single overriding constraint on Lunar Lake (`supports_immad=1`):
+the fused-into node must have exactly ONE user. Plus `optimize_data(true)`+`use_onednn(true)`
+already set. Findings:
+- **oneDNN FC on Lunar Lake DOES accept eltwise(sum/prod) + activation(swish=SILU) post-ops**
+  (applied as oneDNN matmul post-ops, single fused kernel) - confirmed via
+  `create_onednn_primitive_attributes` (`program_node.cpp:1528`, `fully_connected_onednn.cpp:376`).
+  This unblocks the whole FC-fusion family. (Prior exploration had stale-framed oneDNN FC
+  engagement as an open blocker - it isn't; the downcast-act path engages oneDNN FC for the
+  common f16-weight case.)
+- `rms` + eltwise(MUL gamma) fuses UNGATED (rms in the parent list at `:1074`;
+  `rms_kernel_bfyx_opt` declares `ELTWISE`).
+- `fuse_swiglu` SKIPS FC on immad (`:229`) -> SwiGLu must be built as FC->act(swish)->eltwise(prod),
+  NOT via the swiglu primitive.
+
+**Mechanism (ggml-ovgpu.{hpp,cpp}, ggml-ovgpu-ops.cpp):**
+- Extracted `rms_core` / `mul_mat_core` from `build_rms_norm` / `build_mul_mat`: append the
+  compute primitive to a SHARED `cldnn::topology` (no trailing reorder, no `make_network`),
+  namespaced by a `prefix` so head + children coexist without id collisions. `build_*` became
+  core + trailing reorder + make_network (behavior identical - the refactor was
+  regression-checked: 1869/1869 before any fusion wiring).
+- `build_chain(nodes)`: one topology, head core -> each child core consumes the previous
+  compute-out in the HEAD's output-layout convention (flat bfyx for FC, reduce-ne0 for rms)
+  so the fuser's shape-broadcast rule holds; the child's external operand (residual/gamma)
+  bound in that same layout, cast to the head's compute-output dtype; one trailing reorder +
+  one `make_network`. `compiled_op` extended with `is_chain`/`input_layouts`/`input_src_map`/
+  `chain_len`; `op_cache` got a `chain_cache` + negative `chain_fail_cache`.
+- `graph_compute` chain detection: a consumer-count pre-pass finds maximal linear chains
+  [head, child1, ...] (head MUL_MAT/RMS_NORM, children ADD/MUL/UNARY-SILU) where each non-final
+  node's output has exactly one consumer. **Availability check**: a child's external operand
+  must be a leaf or a cgraph node already materialized BEFORE the head (index < head) - this
+  rejects diamond patterns like `((mm1+mm2)+mm3)` where a sibling matmul is computed after
+  the head (the test-backend-ops `MUL_MAT o>1` case). Absorbed children are skipped; the head
+  executes the whole chain. Fallback: if `build_chain` rejects/throws, un-absorb members and
+  run per-op (correctness preserved). `bind_input`/`bind_output` helpers factored out, shared
+  by both paths.
+
+**Diagnostics:** `GGML_OVGPU_FUSE_TRACE=1` walks `net->get_program()->get_processing_order()`
+and prints each FC/rms node's `has_fused_primitives()` + fused `desc->id` list - confirms the
+chain fused (vs separate kernels). Needs `#include "program_node.h"` + a CMake include dir
+(`${OVGPU_INTEL_GPU}/src/graph`, for `registry/implementation_manager.hpp`). `GGML_OVGPU_FUSE_DISABLE=1`
+skips detection entirely (pure per-op A/B + safety).
+
+**Bugs hit + fixed:**
+- A `MUL_MAT o=3` test case (`((mm1+mm2)+mm3)` diamond) regressed: the detector formed
+  `mm1->ADD->ADD` and ran it at mm1's position, reading mm2/mm3 before computed -> wrong output.
+  Fix: the availability check above (a child's external operand must predate the head).
+- After that, a strided-FC + ADD chain (`k_v=64` test) still mis-computed: with strided/
+  flat-padded FC inputs the FC output stays in cldnn's preferred (blocked) format with no
+  trailing reorder before the eltwise, and the oneDNN binary post-op mis-aligns the plain peer.
+  Fix (phase-1 gate): FC chains require CONTIGUOUS operands; strided FC falls back to per-op
+  (correct, unfused). Real weights/activations at residual-ADD points are contiguous, so this
+  only gates artificial test shapes.
+
+**Verification:**
+- `test-backend-ops` full suite: 1869/1869, 0 fail (chains don't form in single-op tests;
+  the strided-FC diamond is gated out and falls back to per-op, which is correct).
+- `llama-simple` (Llama-3.2-1B-Instruct-F16): output **bit-identical** fusion vs
+  `GGML_OVGPU_FUSE_DISABLE=1` ("The capital of France is Paris. The Eiffel Tower...").
+- FUSE_TRACE: both `rms+MUL` and `FC+ADD` chains form with `fused=1` in the real model.
+- Perf (d=0): tg128 fusion ~24 t/s vs disabled ~21.75 (**+10% mean, +23% best**; high
+  variance = cold-start chain build, steady-state is the higher number; disabled rock-stable
+  ~21.9). pp512 unchanged (compute-bound, as expected).
+
+**Phase 2 (FC+SILU): implemented but not triggered.** `activation_silu_core` emits
+`cldnn::activation(swish)`; oneDNN FC accepts it as an `eltwise_swish` post-op. But modern
+llama `build_ffn` (`llama-graph.cpp:~1670`) uses `ggml_swiglu_split` (a single fused GLU op),
+NOT decomposed `ggml_silu`+`ggml_mul` - so FC+SILU chains don't form for llama. Fusing the
+GLU itself needs graph decomposition (replace `GGML_OP_GLU` SwiGLu with SILU+MUL at
+translation) - deferred; that would let `FC->SILU` (done) + `FC->SILU->MUL` chains form and
+hit the FFN decode bottleneck directly.
+
+**Moved the `ovgpu-debug` skill** out of the openvino repo (where it was untracked) into
+`llama.cpp/.claude/skills/ovgpu-debug/` (this repo) - it documents THIS backend, not OV.
+Committed the OV-side debug logging (`OVGPU_FC_TRACE`/`OVGPU_FILL_DEBUG`, env-gated, no
+behavior change) on a branch in the openvino repo -> pushed to the `zijun` (wine99) fork.
+

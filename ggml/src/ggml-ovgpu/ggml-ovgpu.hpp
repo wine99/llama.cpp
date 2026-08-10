@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 struct ggml_tensor;
 
@@ -88,11 +89,42 @@ struct compiled_op {
     // flat-batch mapping (ggml_layout_for); eltwise ops override to a broadcast-
     // preserving mapping (ggml_layout_for_eltwise). graph_compute calls this per input/output.
     std::function<cldnn::layout(const ggml_tensor *)> layout_for = ggml_layout_for;
+
+    // --- Fusion (multi-op chain) extensions. ---
+    // When is_chain, this compiled_op drives a LINEAR chain of ggml ops
+    // [head, child1, ..., childN] fused into ONE cldnn topology. The network's
+    // single output is the chain's final node dst; intermediate (head + non-final
+    // child) outputs are NOT materialized (cldnn fuses them away or holds them as
+    // internal temps). graph_compute binds the chain's external inputs positionally
+    // (input_ids[i] <- the ggml src named by input_src_map[i]) and executes once at
+    // the head, skipping the absorbed children.
+    bool                                     is_chain = false;
+    // Per-external-input bind layout (chain child external operands use the HEAD's
+    // output-layout convention so cldnn's fuser shape rule is satisfied). Empty for
+    // single-op -> graph_compute uses layout_for(src) instead.
+    std::vector<cldnn::layout>               input_layouts;
+    // (chain-node-index, src-index) per external input: input i binds
+    // chain_nodes[node_idx]->src[src_idx]. Self-describing so graph_compute and the
+    // builder cannot drift on input ordering.
+    std::vector<std::pair<int, int>>         input_src_map;
+    // Number of nodes in the chain (head + children). graph_compute skips
+    // chain_len-1 nodes after the head.
+    int                                      chain_len = 0;
 };
 
 // Build a single-op cldnn network for the given ggml node. Returns nullptr if
 // the op/shape/dtype combo is not (yet) supported - caller reports supports_op=false.
 std::unique_ptr<compiled_op>       build_op(const ggml_tensor * node, cldnn::engine & engine, cldnn::stream::ptr stream);
+
+// Build a FUSED multi-op cldnn network for a linear chain of ggml nodes
+// [head, child1, ..., childN]. head is MUL_MAT (FC) or RMS_NORM (rms); each child
+// is ADD/MUL (eltwise) or UNARY-SILU (activation) consuming the previous node's
+// output. cldnn's program fuser merges the children into the head at build time
+// (gated on optimize_data(true), set in make_config). Returns nullptr if the chain
+// is not fusible (caller falls back to per-op). The nodes vector is [head, ...children].
+std::unique_ptr<compiled_op>       build_chain(const std::vector<const ggml_tensor *> & nodes,
+                                               cldnn::engine &                          engine,
+                                               cldnn::stream::ptr                       stream);
 
 // Per-op-network cache. Keyed by a structural signature of the ggml node
 // (op + dtypes + ne[] + flags) so an identical shape bucket reuses the compiled
@@ -102,11 +134,23 @@ struct op_cache {
     cldnn::stream::ptr stream;  // shared in-order stream for ALL op networks (so
                                 // executes are ordered -> no per-op finish needed)
     std::unordered_map<std::string, std::shared_ptr<compiled_op>> m_cache;
+    // Separate cache for fused chains (keyed by a structural signature of the whole
+    // chain, not just one node). Kept distinct from m_cache so the two paths never
+    // collide on a key.
+    std::unordered_map<std::string, std::shared_ptr<compiled_op>> chain_cache;
+    // Negative cache: chains whose build threw / build_chain rejected. Prevents
+    // retrying (and re-logging) a non-fusible chain on every graph_compute call. The
+    // detector can therefore be loose; build_chain is the authority on eligibility.
+    std::unordered_set<std::string>                                  chain_fail_cache;
     std::mutex      m_mutex; // test-backend-ops runs cases in parallel threads
 
     static std::string key_for(const ggml_tensor * node);
 
     std::unique_ptr<compiled_op> get_or_build(const ggml_tensor * node);
+
+    // Build (or fetch from chain_cache) a fused chain for `nodes` ([head, ...children]).
+    // Returns nullptr if the chain is not fusible / build threw.
+    std::unique_ptr<compiled_op> get_or_build_chain(const std::vector<const ggml_tensor *> & nodes);
 };
 
 }  // namespace ggml::ovgpu

@@ -6,8 +6,10 @@
 #include <intel_gpu/graph/network.hpp>
 #include <intel_gpu/graph/program.hpp>
 #include <intel_gpu/graph/topology.hpp>
+#include "program_node.h" // FUSE_TRACE: has_fused_primitives / get_fused_primitives / is_type
 #include <intel_gpu/primitives/custom_gpu_primitive.hpp>
 #include <intel_gpu/primitives/data.hpp>
+#include <intel_gpu/primitives/activation.hpp>
 #include <intel_gpu/primitives/eltwise.hpp>
 #include <intel_gpu/primitives/fully_connected.hpp>
 #include <intel_gpu/primitives/gather.hpp>
@@ -787,46 +789,17 @@ std::unique_ptr<compiled_op> op_cache::get_or_build(const ggml_tensor * node) {
 // path; the M2 fix is to bake weights natively (data nodes / blocked layout) so the
 // selected kernel reads them in place. Correctness first for M1.
 
-static std::unique_ptr<compiled_op> build_mul_mat(const ggml_tensor * node, cldnn::engine & engine, cldnn::stream::ptr stream) {
+// Append the fully_connected compute primitive (NO trailing reorder, NO make_network)
+// to `topo`. `prefix` namespaces the primitive ids so a chain head + its children can
+// share one topology without id collisions. Returns the FC compute-output id
+// (prefix+"fc_out"). Caller must have validated the node (2D weight, ok operands).
+static std::string mul_mat_core(cldnn::topology & topo, const ggml_tensor * node,
+                                cldnn::engine & engine, const std::string & prefix) {
     const ggml_tensor * weight = node->src[0];
     const ggml_tensor * act    = node->src[1];
-    if (!weight || !act) return nullptr;
-    if (!type_supported(weight->type) || !type_supported(act->type)) return nullptr;
-    if (ggml_n_dims(weight) != 2) return nullptr; // weight must be 2D (matches supports_op)
-    const bool w_contig = ggml_is_contiguous(weight);
-    const bool a_contig = ggml_is_contiguous(act);
-    // Accept contiguous, flat-padded-view (k_v sub-box), OR strided-view (permuted/
-    // transposed - e.g. the decomposed attention's permuted KV-cache q/k/v views).
-    auto ok_operand = [](const ggml_tensor * t) {
-        return ggml_is_contiguous(t) || ggml_is_flat_padded_view(t) || ggml_is_strided_view(t);
-    };
-    if (!ok_operand(weight) || !ok_operand(act)) {
-        return nullptr;
-    }
+    const std::string   w_id   = prefix + "in_0"; // weight     (src[0])
+    const std::string   a_id   = prefix + "in_1"; // activation (src[1])
 
-    auto co = std::make_unique<compiled_op>();
-    // input_ids follow ggml src order so graph_compute binds src[k] -> input_ids[k].
-    //   src[0] = weight, src[1] = activation.
-    const std::string w_id = "in_0"; // weight     (src[0])
-    const std::string a_id = "in_1"; // activation (src[1])
-    co->input_ids  = {w_id, a_id};
-    co->weight_ids = {w_id};
-    co->output_id  = "out";
-    // layout_for dispatches to match the input_layout each operand is bound with:
-    // flat for contiguous, flat-padded for k_v sub-box, strided for permuted views.
-    co->layout_for = [](const ggml_tensor * t) -> cldnn::layout {
-        if (ggml_is_contiguous(t)) {
-            return ggml_layout_for(t);
-        }
-        if (ggml_is_flat_padded_view(t)) {
-            return ggml_layout_for_maybe_padded(t);
-        }
-        return ggml_layout_for_strided(t);
-    };
-
-    // Both operands are bound per-compute as input_layouts -> network is shape-keyed,
-    // so layers with identical dims share one compiled network.
-    cldnn::topology topo;
     // Bind a possibly-strided/permuted/padded operand and compact it into the flat
     // layout FC expects. Three cases:
     //  (a) contiguous: single input_layout (flat). No-op.
@@ -834,7 +807,7 @@ static std::unique_ptr<compiled_op> build_mul_mat(const ggml_tensor * node, cldn
     //  (c) strided/permuted view (e.g. permuted KV cache): bind strided (physical
     //      nesting) -> permute to ne0->x/ne1->y/ne2->f/ne3->b -> reorder (strip pad
     //      + cast to eltwise dense) -> reshape to flat-batch (free reinterpret).
-    auto            v = [](int64_t n) {
+    auto v = [](int64_t n) {
         return (cldnn::tensor::value_type) std::max<int64_t>(n, 1);
     };
     auto bind_operand = [&](const std::string & id, const ggml_tensor * t) -> std::string {
@@ -871,24 +844,11 @@ static std::unique_ptr<compiled_op> build_mul_mat(const ggml_tensor * node, cldn
     // and reads f16/bf16 weights per-element into f32; oneDNN's f16/bf16 matmul on
     // Intel GPU accumulates in f32 too (DPAS), so f16f16->f32 out matches ggml
     // semantics - the only difference is the activation gets f16/bf16-rounded,
-    // which every f16-weight backend does anyway.
-    //
-    // So the preferred path is: downcast the (cheap) activation to the weight's
-    // dtype and run the native matching-dtype case - native weight read (no per-token
-    // repack), one cheap act reorder. Only when the dtypes don't share a dense
-    // compute class (e.g. weight f16 + act bf16, or act is f32 and we choose not to
-    // round it) do we fall back to upcasting BOTH operands to f32 (oneDNN f32f32),
-    // which is exact but repacks the weight every token.
-    //
-    // On non-immad devices (ocl bfyx_ref) the situation from the M1 UHD-770 work
-    // stands: the ocl path mis-reads f16 weights for some batch sizes, so weights
-    // are upcast to f32 per compute (the both-to-f32 path) regardless.
+    // which every f16-weight backend does anyway. On non-immad devices the ocl path
+    // mis-reads f16 weights for some batch sizes, so both operands upcast to f32.
     const bool        supports_immad = engine.get_device_info().supports_immad;
     ov::element::Type compute_dt     = ov::element::f32;  // default: both -> f32
     if (supports_immad) {
-        // Prefer the weight's native dtype when the activation can be cheaply
-        // downcast to it (same storage class: f16 weight + f16/f32 act -> f16;
-        // bf16 weight + bf16/f32 act -> bf16). Otherwise f32.
         if (weight->type == GGML_TYPE_F16) {
             compute_dt = ov::element::f16;
         } else if (weight->type == GGML_TYPE_BF16) {
@@ -906,16 +866,60 @@ static std::unique_ptr<compiled_op> build_mul_mat(const ggml_tensor * node, cldn
         topo.add(cldnn::reorder(out_id, cldnn::input_info(in_id), l));
         return out_id;
     };
-    std::string fc_weight = convert(w_bound, "w_conv", weight);
-    std::string fc_input  = convert(a_bound, "act_conv", act);
+    std::string fc_weight = convert(w_bound, prefix + "w_conv", weight);
+    std::string fc_input  = convert(a_bound, prefix + "act_conv", act);
 
-    topo.add(cldnn::fully_connected("fc_out", cldnn::input_info(fc_input), fc_weight, "",
+    const std::string fc_out_id = prefix + "fc_out";
+    topo.add(cldnn::fully_connected(fc_out_id, cldnn::input_info(fc_input), fc_weight, "",
                                     2 /*input_size*/, 2 /*weights_rank*/, true /*weights_transposed*/));
+    return fc_out_id;
+}
+
+static std::unique_ptr<compiled_op> build_mul_mat(const ggml_tensor * node, cldnn::engine & engine, cldnn::stream::ptr stream) {
+    const ggml_tensor * weight = node->src[0];
+    const ggml_tensor * act    = node->src[1];
+    if (!weight || !act) return nullptr;
+    if (!type_supported(weight->type) || !type_supported(act->type)) return nullptr;
+    if (ggml_n_dims(weight) != 2) return nullptr; // weight must be 2D (matches supports_op)
+    const bool w_contig = ggml_is_contiguous(weight);
+    const bool a_contig = ggml_is_contiguous(act);
+    // Accept contiguous, flat-padded-view (k_v sub-box), OR strided-view (permuted/
+    // transposed - e.g. the decomposed attention's permuted KV-cache q/k/v views).
+    auto ok_operand = [](const ggml_tensor * t) {
+        return ggml_is_contiguous(t) || ggml_is_flat_padded_view(t) || ggml_is_strided_view(t);
+    };
+    if (!ok_operand(weight) || !ok_operand(act)) {
+        return nullptr;
+    }
+    (void) w_contig; (void) a_contig;
+
+    auto co = std::make_unique<compiled_op>();
+    // input_ids follow ggml src order so graph_compute binds src[k] -> input_ids[k].
+    //   src[0] = weight, src[1] = activation.
+    const std::string w_id = "in_0"; // weight     (src[0])
+    const std::string a_id = "in_1"; // activation (src[1])
+    co->input_ids  = {w_id, a_id};
+    co->weight_ids = {w_id};
+    co->output_id  = "out";
+    // layout_for dispatches to match the input_layout each operand is bound with:
+    // flat for contiguous, flat-padded for k_v sub-box, strided for permuted views.
+    co->layout_for = [](const ggml_tensor * t) -> cldnn::layout {
+        if (ggml_is_contiguous(t)) {
+            return ggml_layout_for(t);
+        }
+        if (ggml_is_flat_padded_view(t)) {
+            return ggml_layout_for_maybe_padded(t);
+        }
+        return ggml_layout_for_strided(t);
+    };
+
+    cldnn::topology topo;
+    std::string    fc_out = mul_mat_core(topo, node, engine, "" /*prefix*/);
 
     // Trailing reorder forces bfyx f32 output: cldnn's layout optimizer can pick a
     // different output format for some shapes (e.g. yxfb for batch=8, a transpose of
     // bfyx for 2D), which would garble the ggml tensor.
-    topo.add(cldnn::reorder(co->output_id, cldnn::input_info("fc_out"), ggml_layout_for(node)));
+    topo.add(cldnn::reorder(co->output_id, cldnn::input_info(fc_out), ggml_layout_for(node)));
 
     cldnn::ExecutionConfig config = make_config();
     // NOTE: do NOT set allow_new_shape_infer(true) - oneDNN FC rank-2 reshape breaks
@@ -1010,6 +1014,44 @@ static std::unique_ptr<compiled_op> build_eltwise(const ggml_tensor * node, cldn
 // ne[0] (the contiguous/feature dim). NO gamma - ggml applies the weight via a separate
 // ggml_mul (or a fused RMS_NORM+MUL). dst type == src0. epsilon in op_params[0].
 // cldnn rms(id, input, epsilon) = no-gamma variant (elementwise_affine=false).
+// Append the rms compute primitive (NO trailing reorder, NO make_network) to `topo`.
+// `prefix` namespaces the primitive ids so a chain head + its children can share one
+// topology without id collisions. Returns the rms compute-output primitive id
+// (prefix+"rms"). Caller must have validated the node (contiguous or padded view).
+static std::string rms_core(cldnn::topology & topo, const ggml_tensor * node, const std::string & prefix) {
+    const ggml_tensor * a = node->src[0];
+    float               eps;
+    memcpy(&eps, node->op_params, sizeof(float));
+    const std::string a_id   = prefix + "in_0";
+    const std::string rms_id = prefix + "rms";
+    if (ggml_is_contiguous(a)) {
+        topo.add(cldnn::input_layout(a_id, ggml_layout_for_reduce_ne0(a)));
+        topo.add(cldnn::rms(rms_id, cldnn::input_info(a_id), eps));
+    } else {
+        // Non-contiguous "padded view" (e.g. ggml_view_4d of a sub-box). Bind via
+        // the per-dim padded layout, then: (1) reorder strips the padding, yielding
+        // a DENSE per-dim tensor - note cldnn::reorder does NOT reshape: it keeps the
+        // SOURCE's used tensor and only adopts the target's dtype/padding/format
+        // (reorder.cpp:172-174); (2) a reshape flattens that to the reduce-ne0 layout
+        // (b=ne1*ne2*ne3, f=1, x=ne0, y=1) so rms sees y=1 and reduces over ne0 only -
+        // correct for BOTH rms_gpu_bfyx_opt (reduces over X) AND rms_gpu_ref (over
+        // X*Y*Z). Without the reshape, ref would reduce over ne0*ne1 -> wrong scale.
+        // The reshape is a free reinterpret: dense per-dim and flat share ggml byte
+        // order (((i3*ne2+i2)*ne1+i1)*ne0+i0).
+        topo.add(cldnn::input_layout(a_id, ggml_layout_for_padded(a)));
+        const std::string compact_id = prefix + "compact";
+        topo.add(cldnn::reorder(compact_id, cldnn::input_info(a_id), ggml_layout_for_reduce_ne0(a)));
+        auto               v = [](int64_t n) {
+            return (cldnn::tensor::value_type) std::max<int64_t>(n, 1);
+        };
+        int64_t            batch = a->ne[1] * a->ne[2] * a->ne[3];
+        const std::string  flat_id = prefix + "flat";
+        topo.add(cldnn::reshape(flat_id, cldnn::input_info(compact_id), cldnn::tensor(v(batch), 1, v(a->ne[0]), 1)));
+        topo.add(cldnn::rms(rms_id, cldnn::input_info(flat_id), eps));
+    }
+    return rms_id;
+}
+
 static std::unique_ptr<compiled_op> build_rms_norm(const ggml_tensor * node, cldnn::engine & engine, cldnn::stream::ptr stream) {
     const ggml_tensor * a = node->src[0];
     if (!a) {
@@ -1023,9 +1065,6 @@ static std::unique_ptr<compiled_op> build_rms_norm(const ggml_tensor * node, cld
         return nullptr;
     }
 
-    float eps;
-    memcpy(&eps, node->op_params, sizeof(float));
-
     auto              co   = std::make_unique<compiled_op>();
     const std::string a_id = "in_0";
     co->input_ids          = { a_id };
@@ -1036,33 +1075,10 @@ static std::unique_ptr<compiled_op> build_rms_norm(const ggml_tensor * node, cld
     // reduction = ne[0]. b/f/y carry the per-row grouping. Zero-copy (ne[0] on x).
     co->layout_for         = ggml_layout_for_reduce_ne0_maybe_padded;
 
-    cldnn::topology topo;
-    if (contig) {
-        topo.add(cldnn::input_layout(a_id, ggml_layout_for_reduce_ne0(a)));
-        topo.add(cldnn::rms("rms", cldnn::input_info(a_id), eps));
-    } else {
-        // Non-contiguous "padded view" (e.g. ggml_view_4d of a sub-box). Bind via
-        // the per-dim padded layout, then: (1) reorder strips the padding, yielding
-        // a DENSE per-dim (b=ne3,f=ne2,y=ne1,x=ne0) tensor - note cldnn::reorder
-        // does NOT reshape: it keeps the SOURCE's used tensor and only adopts the
-        // target's dtype/padding/format (reorder.cpp:172-174); (2) a reshape
-        // flattens that to the reduce-ne0 layout (b=ne1*ne2*ne3, f=1, x=ne0, y=1)
-        // so rms sees y=1 and reduces over ne0 only - correct for BOTH
-        // rms_gpu_bfyx_opt (reduces over X) AND rms_gpu_ref (reduces over X*Y*Z).
-        // Without the reshape, ref would reduce over ne0*ne1 -> wrong RMS scale.
-        // The reshape is a free reinterpret: dense per-dim and flat are the same
-        // ggml byte order (((i3*ne2+i2)*ne1+i1)*ne0+i0).
-        topo.add(cldnn::input_layout(a_id, ggml_layout_for_padded(a)));
-        topo.add(cldnn::reorder("compact", cldnn::input_info(a_id), ggml_layout_for_reduce_ne0(a)));
-        auto v = [](int64_t n) {
-            return (cldnn::tensor::value_type) std::max<int64_t>(n, 1);
-        };
-        int64_t batch = a->ne[1] * a->ne[2] * a->ne[3];
-        topo.add(cldnn::reshape("flat", cldnn::input_info("compact"), cldnn::tensor(v(batch), 1, v(a->ne[0]), 1)));
-        topo.add(cldnn::rms("rms", cldnn::input_info("flat"), eps));
-    }
+    cldnn::topology   topo;
+    std::string       rms_id = rms_core(topo, node, "" /*prefix*/);
     // Trailing reorder -> ggml dst layout (a's dtype, reduce-ne0). dst type == a->type.
-    topo.add(cldnn::reorder(co->output_id, cldnn::input_info("rms"), ggml_layout_for_reduce_ne0(node)));
+    topo.add(cldnn::reorder(co->output_id, cldnn::input_info(rms_id), ggml_layout_for_reduce_ne0(node)));
 
     co->net = make_network(engine, stream, topo, make_config());
     return co;
@@ -2114,6 +2130,339 @@ std::unique_ptr<compiled_op> build_op(const ggml_tensor * node, cldnn::engine & 
         default:
             return nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fusion: multi-op cldnn topologies for fusible chains
+// ---------------------------------------------------------------------------
+//
+// ovgpu is otherwise Tier A (one single-primitive cldnn network per ggml op), so
+// cldnn's program-level fuser (prepare_primitive_fusing.cpp, gated on
+// optimize_data(true) which make_config sets) has nothing to merge. build_chain
+// instead builds ONE topology for a linear chain [head, child1, ..., childN] and
+// lets program::fuse_nodes merge the children into the head at build time.
+//
+// Fusible on Lunar Lake (supports_immad=1), verified against the fuser predicates:
+//   head = MUL_MAT (FC)  -> children ADD/MUL fuse as oneDNN binary/sum post-ops
+//                          (fc_supports_fusings true on the oneDNN path)
+//   head = RMS_NORM (rms)-> children ADD/MUL fuse as the rms ELTWISE fused op
+//                          (ungated; rms_kernel_bfyx_opt declares ELTWISE)
+// The single overriding constraint (enforced by the detector in graph_compute, not
+// here): the head's output must have exactly ONE user (the chain). build_chain only
+// validates shape/dtype/contiguity eligibility and returns nullptr if not fusible
+// (caller falls back to per-op).
+
+// One external (ggml-side) input recorded while building a chain: the cldnn
+// input_layout id, the layout graph_compute must bind it with, and which
+// (chain-node-index, src-index) it corresponds to.
+struct chain_ext_input {
+    std::string   id;
+    cldnn::layout layout;
+    int           node_idx;  // index into the chain's nodes vector
+    int           src_idx;   // nodes[node_idx]->src[src_idx]
+};
+
+// Append an eltwise (ADD/MUL) CHILD consuming `upstream_id` (the previous compute-
+// out) plus one external operand, to `topo`. The external operand is bound in the
+// HEAD's output-layout convention (`ext_layout_fn`) and cast to `out_dt` so cldnn's
+// fuser shape/dtype rule is satisfied (the eltwise adopts the head's output layout,
+// NOT its own native eltwise layout). Records the external input in `ext`. Returns
+// the eltwise compute-output id, or "" if the child has no external operand.
+static std::string eltwise_child_core(cldnn::topology & topo, const ggml_tensor * node,
+                                      const std::string & prefix, const std::string & upstream_id,
+                                      const ggml_tensor * upstream_tensor, ov::element::Type out_dt,
+                                      std::function<cldnn::layout(const ggml_tensor *)> ext_layout_fn,
+                                      int node_idx, chain_ext_input & ext) {
+    int ext_idx = -1;
+    for (int k = 0; k < GGML_MAX_SRC; k++) {
+        if (!node->src[k]) {
+            continue;
+        }
+        if (node->src[k] == upstream_tensor) {
+            continue;  // chain-flowing input
+        }
+        ext_idx = k;
+        break;
+    }
+    if (ext_idx < 0) {
+        return "";  // ADD/MUL always has an external operand
+    }
+    const ggml_tensor * e   = node->src[ext_idx];
+    cldnn::layout       lay = ext_layout_fn(e);
+    const std::string   in_id = prefix + "in";
+    std::string         bound;
+    if (ggml_type_to_cldnn(e->type) == out_dt) {
+        topo.add(cldnn::input_layout(in_id, lay));
+        bound = in_id;
+    } else {
+        // cast external operand to the head's compute-output dtype
+        topo.add(cldnn::input_layout(in_id, lay));
+        const std::string cast_id = prefix + "cast";
+        cldnn::layout     cast_lay{ out_dt, cldnn::format::bfyx, lay.get_tensor() };
+        topo.add(cldnn::reorder(cast_id, cldnn::input_info(in_id), cast_lay));
+        bound = cast_id;
+    }
+    cldnn::eltwise_mode mode = (node->op == GGML_OP_ADD) ? cldnn::eltwise_mode::sum : cldnn::eltwise_mode::prod;
+    const std::string   ew_id = prefix + "ew";
+    topo.add(cldnn::eltwise(ew_id, cldnn::input_info(upstream_id), cldnn::input_info(bound), mode));
+    ext = { in_id, lay, node_idx, ext_idx };
+    return ew_id;
+}
+
+// Append an activation(SILU = swish) CHILD consuming `upstream_id` (the previous
+// compute-out) to `topo`. SILU is unary (one src = the upstream), so it records NO
+// external input. SILU = x*sigmoid(x) = cldnn activation_func::swish (alpha=1); oneDNN
+// FC accepts it as an eltwise_swish post-op (convert_activation_func swish->eltwise_swish).
+// Returns the activation compute-output id.
+static std::string activation_silu_core(cldnn::topology & topo, const std::string & prefix,
+                                        const std::string & upstream_id) {
+    const std::string act_id = prefix + "act";
+    topo.add(cldnn::activation(act_id, cldnn::input_info(upstream_id), cldnn::activation_func::swish));
+    return act_id;
+}
+
+// Structural signature of a chain (head + each child's full key + which src of each
+// child is the chain-flowing input). Distinct chains -> distinct keys so the
+// chain_cache never shares a network between structurally different chains.
+static std::string chain_key_for(const std::vector<const ggml_tensor *> & nodes) {
+    std::ostringstream s;
+    s << "CHAIN|n=" << nodes.size();
+    s << "|h=" << op_cache::key_for(nodes[0]);
+    const ggml_tensor * prev = nodes[0];
+    for (size_t i = 1; i < nodes.size(); i++) {
+        const ggml_tensor * c = nodes[i];
+        int up_idx = -1;
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (c->src[k] == prev) {
+                up_idx = k;
+                break;
+            }
+        }
+        s << "|c" << i << "=" << op_cache::key_for(c) << "|up" << i << "=" << up_idx;
+        prev = c;
+    }
+    return s.str();
+}
+
+std::unique_ptr<compiled_op> build_chain(const std::vector<const ggml_tensor *> & nodes,
+                                         cldnn::engine &                          engine,
+                                         cldnn::stream::ptr                       stream) {
+    if (nodes.size() < 2) {
+        return nullptr;
+    }
+    const ggml_tensor * head = nodes[0];
+    const bool          head_is_fc  = (head->op == GGML_OP_MUL_MAT);
+    const bool          head_is_rms = (head->op == GGML_OP_RMS_NORM);
+    if (!head_is_fc && !head_is_rms) {
+        return nullptr;
+    }
+
+    // Head eligibility (mirrors the standalone build_* / supports_op guards) + the
+    // per-head layout conventions. head_layout_for binds the head's OWN operands
+    // (matches the standalone layout_for); head_out_layout_fn is the head's OUTPUT
+    // layout, in which child external operands are bound so the fuser's shape rule
+    // holds. head_out_dt = head dst dtype (FC->f32, rms preserves src dtype).
+    std::function<cldnn::layout(const ggml_tensor *)> head_layout_for;
+    std::function<cldnn::layout(const ggml_tensor *)> head_out_layout_fn;
+    auto flat_batch = [](const ggml_tensor * t) { return t->ne[1] * t->ne[2] * t->ne[3]; };
+
+    if (head_is_fc) {
+        const ggml_tensor * w = head->src[0];
+        const ggml_tensor * a = head->src[1];
+        if (!w || !a) {
+            return nullptr;
+        }
+        if (!type_supported(w->type) || !type_supported(a->type)) {
+            return nullptr;
+        }
+        if (ggml_n_dims(w) != 2) {
+            return nullptr;
+        }
+        // Phase 1: only fuse FC chains with CONTIGUOUS operands. With strided/
+        // flat-padded FC inputs the FC output stays in cldnn's preferred (possibly
+        // blocked) format with no trailing reorder before the eltwise, and the
+        // oneDNN binary post-op can misalign the plain peer -> wrong output. Real
+        // weights/activations at residual-ADD points are contiguous, so this gates
+        // out only artificial cases (e.g. test-backend-ops k_v!=0 diamonds); they
+        // fall back to per-op (correct, just unfused).
+        if (!ggml_is_contiguous(w) || !ggml_is_contiguous(a)) {
+            return nullptr;
+        }
+        if (w->ne[0] != a->ne[0]) {
+            return nullptr;
+        }
+        head_layout_for = [](const ggml_tensor * t) -> cldnn::layout {
+            if (ggml_is_contiguous(t)) {
+                return ggml_layout_for(t);
+            }
+            if (ggml_is_flat_padded_view(t)) {
+                return ggml_layout_for_maybe_padded(t);
+            }
+            return ggml_layout_for_strided(t);
+        };
+        head_out_layout_fn = ggml_layout_for;  // flat bfyx (FC output layout)
+    } else {  // rms
+        const ggml_tensor * a = head->src[0];
+        if (!a || !type_supported(a->type)) {
+            return nullptr;
+        }
+        if (!ggml_is_contiguous(a) && !ggml_is_padded_view(a)) {
+            return nullptr;
+        }
+        head_layout_for     = ggml_layout_for_reduce_ne0_maybe_padded;
+        head_out_layout_fn  = ggml_layout_for_reduce_ne0;
+    }
+    const ov::element::Type head_out_dt = ggml_type_to_cldnn(head->type);
+
+    cldnn::topology topo;
+    std::vector<std::string>                input_ids;
+    std::vector<cldnn::layout>              input_layouts;
+    std::vector<std::pair<int, int>>        input_src_map;
+
+    // Head core.
+    std::string compute_out;
+    if (head_is_fc) {
+        compute_out = mul_mat_core(topo, head, engine, "h_");
+        // head external inputs: src[0] (weight), src[1] (activation)
+        input_ids.push_back("h_in_0");
+        input_layouts.push_back(head_layout_for(head->src[0]));
+        input_src_map.push_back({ 0, 0 });
+        input_ids.push_back("h_in_1");
+        input_layouts.push_back(head_layout_for(head->src[1]));
+        input_src_map.push_back({ 0, 1 });
+    } else {
+        compute_out = rms_core(topo, head, "h_");
+        input_ids.push_back("h_in_0");
+        input_layouts.push_back(head_layout_for(head->src[0]));
+        input_src_map.push_back({ 0, 0 });
+    }
+
+    // Children: ADD/MUL (eltwise) or UNARY-SILU (activation). SILU is unary (no
+    // external operand); ADD/MUL have an external operand (residual/gamma/gate).
+    const ggml_tensor * upstream = head;
+    for (size_t i = 1; i < nodes.size(); i++) {
+        const ggml_tensor * child = nodes[i];
+        const bool          is_eltwise = (child->op == GGML_OP_ADD || child->op == GGML_OP_MUL);
+        const bool          is_silu =
+            (child->op == GGML_OP_UNARY && ggml_get_op_params_i32(child, 0) == GGML_UNARY_OP_SILU);
+        if (!is_eltwise && !is_silu) {
+            return nullptr;
+        }
+        // child must consume the previous node's output as one src.
+        int up_idx = -1, ext_idx = -1;
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            if (!child->src[k]) {
+                continue;
+            }
+            if (child->src[k] == upstream) {
+                up_idx = k;
+            } else {
+                ext_idx = k;
+            }
+        }
+        if (up_idx < 0) {
+            return nullptr;
+        }
+
+        const std::string prefix = "c" + std::to_string(i - 1) + "_";
+        if (is_silu) {
+            compute_out = activation_silu_core(topo, prefix, compute_out);
+        } else {
+            // ADD/MUL: the external operand must be contiguous and broadcast cleanly
+            // in the head's output layout (flat-batch==1 or==head; ne[0]==1 or==head).
+            const ggml_tensor * e = child->src[ext_idx];
+            if (!e || !type_supported(e->type) || !ggml_is_contiguous(e)) {
+                return nullptr;
+            }
+            const int64_t hb = flat_batch(head), eb = flat_batch(e);
+            const bool   ok_b = (eb == 1 || eb == hb);
+            const bool   ok_f = (e->ne[0] == 1 || e->ne[0] == head->ne[0]);
+            if (!ok_b || !ok_f) {
+                return nullptr;
+            }
+            chain_ext_input ext;
+            std::string     ew = eltwise_child_core(topo, child, prefix, compute_out, upstream,
+                                                    head_out_dt, head_out_layout_fn, (int) i, ext);
+            if (ew.empty()) {
+                return nullptr;
+            }
+            compute_out = ew;
+            input_ids.push_back(ext.id);
+            input_layouts.push_back(ext.layout);
+            input_src_map.push_back({ ext.node_idx, ext.src_idx });
+        }
+        upstream = child;
+    }
+
+    // One trailing reorder -> the chain's final-node dst layout (forces bfyx so the
+    // ggml tensor bytes line up; cldnn's layout optimizer could otherwise pick a
+    // transposed format for some shapes).
+    auto                    co = std::make_unique<compiled_op>();
+    const ggml_tensor *     final_node = nodes.back();
+    co->output_id  = "chain_out";
+    cldnn::layout  out_lay = head_is_fc ? ggml_layout_for(final_node) : ggml_layout_for_reduce_ne0(final_node);
+    topo.add(cldnn::reorder(co->output_id, cldnn::input_info(compute_out), out_lay));
+
+    co->net          = make_network(engine, stream, topo, make_config());
+    co->input_ids    = std::move(input_ids);
+    co->input_layouts = std::move(input_layouts);
+    co->input_src_map = std::move(input_src_map);
+    co->is_chain     = true;
+    co->chain_len    = (int) nodes.size();
+    co->layout_for   = head_is_fc ? ggml_layout_for : ggml_layout_for_reduce_ne0;
+
+    // GGML_OVGPU_FUSE_TRACE: confirm the children actually fused into the head (vs
+    // running as separate kernels). Walks the compiled program's processing order
+    // and prints each FC/rms node's fused-primitive list.
+    if (getenv("GGML_OVGPU_FUSE_TRACE")) {
+        fprintf(stderr, "[ovgpu][fuse] chain len=%d head=%s\n", (int) nodes.size(), ggml_op_name(head->op));
+        auto prog = co->net->get_program();
+        for (cldnn::program_node * pn : prog->get_processing_order()) {
+            if (pn->is_type<cldnn::fully_connected>() || pn->is_type<cldnn::rms>()) {
+                fprintf(stderr, "[ovgpu][fuse]   %-12s fused=%d", pn->id().c_str(), (int) pn->has_fused_primitives());
+                for (auto & fp : pn->get_fused_primitives()) {
+                    fprintf(stderr, " [%s]", fp.desc->id.c_str());
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    return co;
+}
+
+std::unique_ptr<compiled_op> op_cache::get_or_build_chain(const std::vector<const ggml_tensor *> & nodes) {
+    std::string       key = chain_key_for(nodes);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    static const bool no_cache = getenv("GGML_OVGPU_NO_CACHE") != nullptr;
+    auto              it = no_cache ? chain_cache.end() : chain_cache.find(key);
+    if (it != chain_cache.end()) {
+        return std::make_unique<compiled_op>(*it->second);
+    }
+    if (!no_cache && chain_fail_cache.count(key)) {
+        return nullptr;  // previously failed to build - don't retry every token
+    }
+    std::unique_ptr<compiled_op> co;
+    try {
+        co = build_chain(nodes, *engine, stream);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "OVGPU: build_chain threw: %s\nkey=%s\n", e.what(), key.c_str());
+        if (!no_cache) {
+            chain_fail_cache.insert(key);
+        }
+        return nullptr;
+    }
+    if (!co) {
+        // build_chain rejected this chain (shape/dtype/contiguity not fusible) - cache
+        // the rejection so the detector's loose check doesn't re-form it every call.
+        if (!no_cache) {
+            chain_fail_cache.insert(key);
+        }
+        return nullptr;
+    }
+    if (!no_cache) {
+        chain_cache[key] = std::make_shared<compiled_op>(*co);
+    }
+    return co;
 }
 
 }  // namespace ggml::ovgpu
